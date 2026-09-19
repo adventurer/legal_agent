@@ -9,7 +9,6 @@
 """
 
 import sys
-import json
 import time
 import html
 import re
@@ -20,12 +19,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
-import httpx
-from httpx_sse import connect_sse
 import streamlit as st
 from services.report_parser import clean_report_content
 from web.api_client import check_gateway_health as fetch_gateway_health
 from web.api_client import upload_contract_file as send_contract_file
+from web.sse_client import stream_contract_review
 
 API_BASE_URL = "http://127.0.0.1:9000"
 
@@ -286,29 +284,26 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
     extracted_final = ""
 
     try:
-        with httpx.Client(timeout=180.0) as client:
-            req_payload = {"contract_text": text_to_review, "max_turns": max_turns, "stream": True}
-            with connect_sse(client, "POST", f"{API_BASE_URL}/api/v1/contract/review/stream", json=req_payload) as event_source:
-                for sse in event_source.iter_sse():
-                    event = sse.event
-                    data = json.loads(sse.data) if sse.data else {}
+        for sse in stream_contract_review(API_BASE_URL, text_to_review, max_turns):
+            event = sse["event"]
+            data = sse["data"]
 
-                    if event == "start":
-                        status_box.update(label=f"[{data.get('task_id', target_name)}] 正在制定审查策略...")
-                    elif event == "token":
-                        accumulated_tokens += data.get("token", "")
-                        thought_container.markdown(
-                            render_reasoning_text(accumulated_tokens),
-                            unsafe_allow_html=True,
-                        )
-                    elif event == "tool_start":
-                        status_box.write(f"🔧 **调度工具** `{data.get('tool')}`: 检索 *'{data.get('query')}'*")
-                    elif event == "tool_result":
-                        status_box.write("📖 **已检索依据并注入模型工作记忆**")
-                    elif event == "circuit_break":
-                        st.session_state.circuit_breaks.append(data)
-                        recs_markdown = "\n".join([f"- **{r}**" for r in data.get("recommendations", [])])
-                        cb_container.markdown(f"""
+            if event == "start":
+                status_box.update(label=f"[{data.get('task_id', target_name)}] 正在制定审查策略...")
+            elif event == "token":
+                accumulated_tokens += data.get("token", "")
+                thought_container.markdown(
+                    render_reasoning_text(accumulated_tokens),
+                    unsafe_allow_html=True,
+                )
+            elif event == "tool_start":
+                status_box.write(f"🔧 **调度工具** `{data.get('tool')}`: 检索 *'{data.get('query')}'*")
+            elif event == "tool_result":
+                status_box.write("📖 **已检索依据并注入模型工作记忆**")
+            elif event == "circuit_break":
+                st.session_state.circuit_breaks.append(data)
+                recs_markdown = "\n".join([f"- **{r}**" for r in data.get("recommendations", [])])
+                cb_container.markdown(f"""
                         <div class="circuit-break-card">
                             <strong>⚠️ 触发熔断保护，切入大模型知识推理</strong><br>
                             • <strong>任务</strong>: {data.get('task_id')}<br>
@@ -317,20 +312,20 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
                             {recs_markdown}
                         </div>
                         """, unsafe_allow_html=True)
-                    elif event == "generation_meta":
-                        st.session_state.latest_meta = data
-                        meta_container.markdown(
-                            f"<span class='meta-badge'>任务: {data.get('task_id')}</span>"
-                            f"<span class='meta-badge'>轮次: {data.get('turn')}</span>"
-                            f"<span class='meta-badge'>输入: {data.get('prompt_chars')} 字 (~{data.get('est_prompt_tokens')} Tks)</span>"
-                            f"<span class='meta-badge'>输出: {data.get('output_chars')} 字 ({data.get('generated_tokens')} Tks)</span>",
-                            unsafe_allow_html=True,
-                        )
-                    elif event == "final_report":
-                        extracted_final = data.get("raw_report", "")
-                        status_box.update(label="✅ 审查完成！", state="complete")
-                    elif event == "done":
-                        break
+            elif event == "generation_meta":
+                st.session_state.latest_meta = data
+                meta_container.markdown(
+                    f"<span class='meta-badge'>任务: {data.get('task_id')}</span>"
+                    f"<span class='meta-badge'>轮次: {data.get('turn')}</span>"
+                    f"<span class='meta-badge'>输入: {data.get('prompt_chars')} 字 (~{data.get('est_prompt_tokens')} Tks)</span>"
+                    f"<span class='meta-badge'>输出: {data.get('output_chars')} 字 ({data.get('generated_tokens')} Tks)</span>",
+                    unsafe_allow_html=True,
+                )
+            elif event == "final_report":
+                extracted_final = data.get("raw_report", "")
+                status_box.update(label="✅ 审查完成！", state="complete")
+            elif event == "done":
+                break
 
         if not extracted_final and "Final:" in accumulated_tokens:
             extracted_final = accumulated_tokens.split("Final:", 1)[1].strip()
@@ -352,23 +347,20 @@ def _worker_clause_review(clause: Dict[str, Any], turns: int) -> Dict[str, Any]:
     circuit_break_info = None
 
     try:
-        with httpx.Client(timeout=180.0) as client:
-            req_payload = {"contract_text": clause_text, "max_turns": turns, "stream": True}
-            with connect_sse(client, "POST", f"{API_BASE_URL}/api/v1/contract/review/stream", json=req_payload) as event_source:
-                for sse in event_source.iter_sse():
-                    event = sse.event
-                    data = json.loads(sse.data) if sse.data else {}
-                    if event == "token":
-                        accumulated_tokens += data.get("token", "")
-                    elif event == "circuit_break":
-                        circuit_break_info = data
-                        logs.append(f"⚠️ 触发熔断: {data.get('reason_type')}")
-                    elif event == "tool_start":
-                        logs.append(f"检索: {data.get('query')}")
-                    elif event == "final_report":
-                        extracted_final = data.get("raw_report", "")
-                    elif event == "done":
-                        break
+        for sse in stream_contract_review(API_BASE_URL, clause_text, turns):
+            event = sse["event"]
+            data = sse["data"]
+            if event == "token":
+                accumulated_tokens += data.get("token", "")
+            elif event == "circuit_break":
+                circuit_break_info = data
+                logs.append(f"⚠️ 触发熔断: {data.get('reason_type')}")
+            elif event == "tool_start":
+                logs.append(f"检索: {data.get('query')}")
+            elif event == "final_report":
+                extracted_final = data.get("raw_report", "")
+            elif event == "done":
+                break
 
         report_content = clean_report_content(
             extracted_final
