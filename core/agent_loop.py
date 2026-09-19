@@ -12,11 +12,9 @@
 4. 输出符合 core/schemas.py 契约的强类型结构化报告
 """
 
-import os
 import sys
-import re
 from pathlib import Path
-from typing import Optional, Dict, Any, Tuple, Callable
+from typing import Optional, Dict, Callable
 
 import httpx
 from openai import OpenAI
@@ -46,6 +44,8 @@ from core.prompts import (
 )
 from core.schemas import AgentExecutionResult
 from services.report_parser import split_final_output
+from core.action_parser import extract_action
+from core.tool_registry import ReviewToolRegistry
 
 # 3. 导入底层知识库与企业自编法典服务
 try:
@@ -57,19 +57,6 @@ try:
     from services.rule_book import EnterpriseRuleBook
 except ImportError:
     EnterpriseRuleBook = None
-
-
-def extract_action(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """解析单行 Action，兼容半角/全角括号和带引号参数。"""
-    for line in text.splitlines():
-        line = line.strip()
-        if line.startswith("Action:"):
-            content = line[len("Action:"):].strip()
-            match = re.fullmatch(r"([A-Za-z_][\w-]*)\s*[\(（](.*)[\)）]", content)
-            if match:
-                name, arg = match.groups()
-                return name.strip(), arg.strip().strip("'\"“”‘’")
-    return None, None
 
 
 class ContractReviewAgent:
@@ -100,34 +87,10 @@ class ContractReviewAgent:
             max_retries=TIMEOUT_CONFIG.get("max_retries", 2),
         )
 
-        self.kb = None
-        self.rule_book = None
-        self.tool_mapping: Dict[str, Callable[[str], str]] = {}
-        self._init_tools()
-
-    def _init_tools(self):
-        """初始化知识库与企业法典检索工具"""
-        # 工具 1 & 工具 2：PDF 知识库（法规 + 合规手册）
-        if PDFKnowledgeBase and os.path.exists(self.docs_dir):
-            print(f"[*] 正在从配置目录载入权威 PDF 参考库: {self.docs_dir}", flush=True)
-            self.kb = PDFKnowledgeBase(self.docs_dir)
-            self.tool_mapping["search_civil_code"] = lambda q: self.kb.search_keyword(q, filter_tag="法")
-            self.tool_mapping["get_company_policy"] = lambda q: self.kb.search_keyword(q, filter_tag="合规")
-        else:
-            print(f"[!] PDF 参考库目录不存在或解析组件缺失，启用法规占位桩。", flush=True)
-            self.tool_mapping["search_civil_code"] = lambda q: f"[模拟] 查阅法规关于: {q}"
-            self.tool_mapping["get_company_policy"] = lambda q: f"[模拟] 查阅政策关于: {q}"
-
-        # 工具 3：企业自编法典与审查偏好记忆库 (SQLite)
-        if EnterpriseRuleBook:
-            print(f"[*] 正在连接企业自编法典数据库: {self.db_path}", flush=True)
-            self.rule_book = EnterpriseRuleBook(db_path=self.db_path)
-            self.tool_mapping["get_past_review_rules"] = lambda q: self.rule_book.search_rules(q)
-        else:
-            print(f"[!] 未检测到 EnterpriseRuleBook 服务，启用自编法典占位桩。", flush=True)
-            self.tool_mapping["get_past_review_rules"] = (
-                lambda q: f"《企业自编法典》中暂无针对【{q}】的特殊审查规则。"
-            )
+        self.tool_registry = ReviewToolRegistry(
+            self.docs_dir, self.db_path, PDFKnowledgeBase, EnterpriseRuleBook
+        )
+        self.tool_mapping: Dict[str, Callable[[str], str]] = self.tool_registry.build()
 
     def register_tool(self, name: str, func: Callable[[str], str]):
         """支持向 Agent 动态注入扩展工具"""
