@@ -12,16 +12,18 @@ import sys
 import json
 import time
 import html
+import re
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT_DIR))
+
 import httpx
 from httpx_sse import connect_sse
 import streamlit as st
-
-ROOT_DIR = Path(__file__).resolve().parent.parent
-sys.path.append(str(ROOT_DIR))
+from services.report_parser import clean_report_content
 
 API_BASE_URL = "http://127.0.0.1:9000"
 
@@ -163,6 +165,23 @@ def render_thought_box(text: str) -> str:
     """
 
 
+def render_reasoning_text(text: str) -> str:
+    """将模型推理流转为纯文本，避免 Markdown 语法直接出现在思考区。"""
+    visible_text = text or ""
+    final_markers = ("Final:", "【最终结论】", "最终审查意见", "综合审查报告")
+    marker_positions = [visible_text.find(marker) for marker in final_markers if visible_text.find(marker) >= 0]
+    if marker_positions:
+        visible_text = visible_text[:min(marker_positions)]
+
+    visible_text = re.sub(r"(?im)^\s*```(?:markdown|md)?\s*$", "", visible_text)
+    visible_text = re.sub(r"(?im)^\s*```\s*$", "", visible_text)
+    visible_text = re.sub(r"^\s{0,3}#{1,6}\s*", "", visible_text, flags=re.MULTILINE)
+    visible_text = re.sub(r"^\s*[-*+]\s+", "• ", visible_text, flags=re.MULTILINE)
+    visible_text = re.sub(r"(\*\*|__|`)", "", visible_text)
+    visible_text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", visible_text)
+    visible_text = visible_text.strip()
+    return render_thought_box(visible_text or "模型正在整理最终审查报告...")
+
 # ==================== 4. 顶部控制栏 ====================
 header_col, status_col = st.columns([3, 1])
 with header_col:
@@ -285,7 +304,10 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
                         status_box.update(label=f"[{data.get('task_id', target_name)}] 正在制定审查策略...")
                     elif event == "token":
                         accumulated_tokens += data.get("token", "")
-                        thought_container.markdown(render_thought_box(accumulated_tokens), unsafe_allow_html=True)
+                        thought_container.markdown(
+                            render_reasoning_text(accumulated_tokens),
+                            unsafe_allow_html=True,
+                        )
                     elif event == "tool_start":
                         status_box.write(f"🔧 **调度工具** `{data.get('tool')}`: 检索 *'{data.get('query')}'*")
                     elif event == "tool_result":
@@ -321,7 +343,7 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
             extracted_final = accumulated_tokens.split("Final:", 1)[1].strip()
 
         st.session_state.is_reviewing = False
-        return extracted_final or accumulated_tokens
+        return clean_report_content(extracted_final or accumulated_tokens)
     except Exception as e:
         st.error(f"连接推理网关异常: {e}")
         st.session_state.is_reviewing = False
@@ -355,7 +377,14 @@ def _worker_clause_review(clause: Dict[str, Any], turns: int) -> Dict[str, Any]:
                     elif event == "done":
                         break
 
-        report_content = extracted_final or (accumulated_tokens.split("Final:", 1)[-1].strip() if "Final:" in accumulated_tokens else accumulated_tokens)
+        report_content = clean_report_content(
+            extracted_final
+            or (
+                accumulated_tokens.split("Final:", 1)[-1].strip()
+                if "Final:" in accumulated_tokens
+                else accumulated_tokens
+            )
+        )
         return {
             "index": clause.get("index", 0),
             "title": clause.get("title", ""),
@@ -477,7 +506,7 @@ with st.container():
     # 渲染 Markdown 报告
     if st.session_state.final_report:
         st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.markdown(st.session_state.final_report)
+        st.markdown(clean_report_content(st.session_state.final_report))
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)

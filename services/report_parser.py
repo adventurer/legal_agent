@@ -1,6 +1,7 @@
 """模型审查报告解析与清洗工具。"""
 
 import json
+import re
 from typing import Any, Optional, Tuple
 
 from core.schemas import ContractReviewReport
@@ -28,17 +29,19 @@ def is_final_report(text: str) -> bool:
 
 
 def clean_report_content(raw_text: str) -> str:
-    """移除常见的最终报告前缀和包裹代码块。"""
+    """移除最终报告标记和正文中的代码围栏，保留围栏内文本内容。"""
     cleaned = (raw_text or "").strip()
     for prefix in ("Final:", "【最终结论】:", "【最终结论】", "最终审查意见:"):
         if prefix in cleaned:
             cleaned = cleaned.split(prefix, 1)[1].strip()
             break
-    if cleaned.startswith("```"):
-        parts = cleaned.split("\n", 1)
-        cleaned = parts[1] if len(parts) == 2 else ""
-        if cleaned.endswith("```"):
-            cleaned = cleaned[:-3].rstrip()
+    # 模型可能把合同原文嵌套在 ```markdown ... ``` 中。只移除围栏行，
+    # 不删除围栏内的合同内容，避免 UI 将 Markdown 控制标记直接展示给用户。
+    cleaned = re.sub(
+        r"(?im)^[ \t]*```[ \t]*(?:markdown|md|text)?[ \t]*\r?$",
+        "",
+        cleaned,
+    )
     return cleaned.strip()
 
 
