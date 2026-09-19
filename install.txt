@@ -58,6 +58,10 @@ $ conda activate legal_agent
        python-multipart \
        streamlit
 
+# Linux/WSL 读取旧版 .doc：
+sudo apt update && sudo apt install -y libreoffice
+# Windows 可选：安装 Microsoft Word 后执行 pip install pywin32
+
 --------------------------------------------------------------------------------
 第三步：拷贝项目工程资产
 --------------------------------------------------------------------------------

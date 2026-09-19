@@ -38,6 +38,7 @@ for directory in [REFERENCE_DOCS_DIR, DATA_DIR, MODELS_DIR]:
 # ==================== 2. 模型与推理服务 (vLLM) 配置 ====================
 # 默认部署的模型名称与物理子目录
 DEFAULT_MODEL_NAME = "qwen2.5-7b"
+DEFAULT_MODEL_KEY = "qwen2.5-7b-awq"
 DEFAULT_MODEL_DIR_NAME = "Qwen2.5-7B-Instruct-AWQ"
 DEFAULT_MODEL_PATH = MODELS_DIR / DEFAULT_MODEL_DIR_NAME
 
@@ -57,7 +58,10 @@ VLLM_CONFIG: Dict[str, Any] = {
     "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEM_UTIL", "0.85")),
     "quantization": "awq",
     "kv_cache_dtype": "auto",  # 保持原生 FP16，严禁在此开启 FP8
+    "model_key": DEFAULT_MODEL_KEY,
 }
+
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(20 * 1024 * 1024)))
 
 
 # ==================== 3. 核心 Agent 推理超参数 ====================
@@ -69,6 +73,7 @@ AGENT_CONFIG: Dict[str, Any] = {
     "max_tokens": 1024,       # 单步生成最大 Token 数
     "stop": ["Observation:"], # ReAct 工具调用截断符
     "max_turns": 6,           # 默认最大推理轮次
+    "max_context_tokens": VLLM_CONFIG["max_model_len"],
 }
 
 # 网络与客户端超时参数 (秒)

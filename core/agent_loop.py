@@ -15,7 +15,6 @@
 import os
 import sys
 import re
-import json
 from pathlib import Path
 from typing import Optional, Dict, Any, Tuple, Callable
 
@@ -45,7 +44,8 @@ from core.prompts import (
     TOOL_CALL_RETRY_PROMPT,
     format_observation,
 )
-from core.schemas import ContractReviewReport, AgentExecutionResult
+from core.schemas import AgentExecutionResult
+from services.report_parser import split_final_output
 
 # 3. 导入底层知识库与企业自编法典服务
 try:
@@ -60,15 +60,15 @@ except ImportError:
 
 
 def extract_action(text: str) -> Tuple[Optional[str], Optional[str]]:
-    """从模型回复文本中精确解析 Action: 工具名(关键词)"""
+    """解析单行 Action，兼容半角/全角括号和带引号参数。"""
     for line in text.splitlines():
         line = line.strip()
         if line.startswith("Action:"):
-            content = line.replace("Action:", "").strip()
-            if "(" in content and content.endswith(")"):
-                name = content.split("(", 1)[0].strip()
-                arg = content.split("(", 1)[1][:-1].strip().strip("'\"")
-                return name, arg
+            content = line[len("Action:"):].strip()
+            match = re.fullmatch(r"([A-Za-z_][\w-]*)\s*[\(（](.*)[\)）]", content)
+            if match:
+                name, arg = match.groups()
+                return name.strip(), arg.strip().strip("'\"“”‘’")
     return None, None
 
 
@@ -213,22 +213,10 @@ class ContractReviewAgent:
             reply = "".join(reply_chunks).strip()
             print()
 
-            # 1. 优先检测是否达成 Final 报告
-            if "Final:" in reply:
+            # 1. 优先检测是否达成 Final 报告，同时兼容模型漏写 Final: 的 Markdown 输出
+            is_final, raw_report, parsed_report = split_final_output(reply)
+            if is_final:
                 print("\n>>> 审查完成，正在解析结构化报告！", flush=True)
-                raw_report = reply.split("Final:", 1)[1].strip()
-
-                parsed_report = None
-                try:
-                    clean_str = raw_report
-                    if clean_str.startswith("```"):
-                        clean_str = clean_str.split("\n", 1)[1]
-                        if clean_str.endswith("```"):
-                            clean_str = clean_str.rsplit("\n", 1)[0]
-                    parsed_dict = json.loads(clean_str.strip())
-                    parsed_report = ContractReviewReport.model_validate(parsed_dict)
-                except Exception as ex:
-                    print(f"[提示: 原始输出转 Pydantic 模型降级: {ex}]", flush=True)
 
                 return AgentExecutionResult(
                     status="success" if parsed_report else "partial_success",

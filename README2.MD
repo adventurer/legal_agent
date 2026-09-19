@@ -14,7 +14,8 @@
   2. `get_company_policy`：核对公司内部合规手册与政策要求。
   3. `get_past_review_rules`：基于 SQLite 的企业自编法典，沉淀特有业务审查偏好与历史红线（如违约金限额、管辖权限制）。
 - 📑 **多模态文档加载与条款切分**：
-  - 支持 `.docx`、`.pdf`、`.txt` 以及常见格式合同图片（`.png`, `.jpg`, `.jpeg` 等）。
+  - 支持 `.docx`、`.doc`、`.pdf`、`.txt` 以及常见格式合同图片（`.png`, `.jpg`, `.jpeg` 等）。
+  - `.docx` 直接解析；旧版 `.doc` 在 Linux/WSL 下通过 LibreOffice `soffice` 无头转换，Windows 可选用 Word COM。
   - 内置本地轻量级 OCR（RapidOCR），离线毫秒级抽取合同扫描件文字。
   - 基于法律文本特征规则，自动将合同精准切分为“第一条、第二条…”语义条款。
 - ⚡ **高性能并发网关与打字机流式推送**：

@@ -20,8 +20,12 @@ pip install pytesseract 可选
 安装字体以适配图片格式自检
 sudo apt update && sudo apt install -y fonts-wqy-microhei fonts-wqy-zenhei
 
-# docx支持
+# Word 文档支持（.docx 直接解析；Linux/WSL 下 .doc 使用 LibreOffice 转换）
 pip install python-docx
+# Linux/WSL 读取旧版 .doc
+sudo apt update && sudo apt install -y libreoffice
+# Windows 读取旧版 .doc 的可选方案
+# pip install pywin32
 
 # gateway
 pip install fastapi uvicorn sse-starlette python-multipart
@@ -44,3 +48,8 @@ python server/vllm_launcher.py --model qwen2.5-7b-awq --no-fp8-kv
 python server/vllm_launcher.py --model qwen2.5-3b --no-fp8-kv
 python gateway/api_server.py
 streamlit run web/app_ui.py --server.port 8501
+
+# 可选运行配置
+# MAX_UPLOAD_BYTES=20971520      # 合同上传大小上限，默认 20 MiB
+# VLLM_MAX_MODEL_LEN=4096        # 模型上下文长度
+# DEFAULT_MODEL_KEY 由 configs/config.py 统一维护，启动器默认使用 qwen2.5-7b-awq

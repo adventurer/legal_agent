@@ -15,8 +15,12 @@ import subprocess
 import sys
 from pathlib import Path
 
-# 获取项目根目录 (假设当前脚本位于 legal_agent_lab/server/)
 ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.append(str(ROOT_DIR))
+
+from configs.config import DEFAULT_MODEL_KEY
+
+# 获取项目根目录 (假设当前脚本位于 legal_agent_lab/server/)
 # 统一且唯一的模型存放基目录：legal_agent_lab/models/
 MODELS_BASE_DIR = ROOT_DIR / "models"
 
@@ -187,7 +191,7 @@ def main():
         "--model",
         "-m",
         type=str,
-        default="qwen2.5-7b-awq",
+        default=DEFAULT_MODEL_KEY,
         choices=list(SUPPORTED_MODELS.keys()),
         help="待启动的模型标识 (默认: qwen2.5-7b-awq)",
     )

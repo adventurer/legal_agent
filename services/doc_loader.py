@@ -3,7 +3,7 @@
 """
 文件名: services/doc_loader.py
 职责:
-1. 多源合同解析：支持 Word (.docx)、PDF (.pdf)、图片 (.png, .jpg, .jpeg, .webp, .bmp) 与纯文本 (.txt, .md)
+1. 多源合同解析：支持 Word (.docx, .doc)、PDF、图片与纯文本
 2. 生产级双轨 PDF 提取：优先毫秒级提取矢量文字；若为扫描件/图片页，自动光栅化为高分图片送入 RapidOCR
 3. 层次化防截断状态机：按“第一条/一、”等主条款聚合；严禁将 1.1、(1) 等款项截断；自动切分前言与签署盖章页
 4. 自带四模态测试数据生成引擎：自动生成 TXT/DOCX/PNG/PDF 并跑通完整闭环测试
@@ -13,6 +13,8 @@ import os
 import re
 import io
 import sys
+import shutil
+import subprocess
 import tempfile
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -90,6 +92,8 @@ class DocumentLoader:
     )
 
     SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
+    SUPPORTED_WORD_EXTS = {".docx", ".doc"}
+    SUPPORTED_TEXT_EXTS = {".txt", ".md"}
 
     def __init__(self):
         pass
@@ -115,6 +119,88 @@ class DocumentLoader:
                     lines.append(" | ".join(unique_texts))
 
         return "\n".join(lines)
+
+    def _convert_doc_to_docx(self, file_path: Path, output_dir: Path) -> Path:
+        """将旧版 .doc 转为临时 .docx，Linux/WSL 优先使用 LibreOffice。"""
+        output_dir.mkdir(parents=True, exist_ok=True)
+        converted_path = output_dir / f"{file_path.stem}.docx"
+        conversion_errors = []
+
+        # Linux/WSL 的标准方案。为每次转换创建独立 profile，避免并发转换互相锁定。
+        soffice = shutil.which("soffice") or shutil.which("libreoffice")
+        if soffice:
+            profile_dir = output_dir / "lo-profile"
+            try:
+                result = subprocess.run(
+                    [
+                        soffice,
+                        f"-env:UserInstallation={profile_dir.as_uri()}",
+                        "--headless",
+                        "--convert-to",
+                        "docx:Office Open XML Text",
+                        "--outdir",
+                        str(output_dir),
+                        str(file_path),
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=False,
+                )
+                if result.returncode == 0 and converted_path.exists():
+                    return converted_path
+                conversion_errors.append(
+                    f"LibreOffice 返回码 {result.returncode}: "
+                    f"{(result.stderr or result.stdout).strip()}"
+                )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                conversion_errors.append(f"LibreOffice: {exc}")
+
+        # Windows 原生兼容方案；不参与 Linux/WSL 的默认路径。
+        if os.name == "nt":
+            word = None
+            document = None
+            try:
+                import win32com.client
+
+                word = win32com.client.DispatchEx("Word.Application")
+                word.Visible = False
+                word.DisplayAlerts = False
+                document = word.Documents.Open(
+                    str(file_path),
+                    ReadOnly=True,
+                    AddToRecentFiles=False,
+                    ConfirmConversions=False,
+                )
+                document.SaveAs2(str(converted_path), FileFormat=16)
+                if converted_path.exists():
+                    return converted_path
+            except (ImportError, OSError, RuntimeError) as exc:
+                conversion_errors.append(f"Word COM: {exc}")
+            finally:
+                if document is not None:
+                    try:
+                        document.Close(False)
+                    except Exception:
+                        pass
+                if word is not None:
+                    try:
+                        word.Quit()
+                    except Exception:
+                        pass
+
+        details = "；".join(error for error in conversion_errors if error)
+        raise RuntimeError(
+            "无法读取旧版 .doc 文件。Linux/WSL 请安装 LibreOffice（soffice），"
+            "Windows 可安装 Microsoft Word 并安装 pywin32。"
+            + (f" 详情: {details}" if details else "")
+        )
+
+    def extract_text_from_doc(self, file_path: Path) -> str:
+        """转换旧版 Word 文档后复用 DOCX 解析逻辑。"""
+        with tempfile.TemporaryDirectory(prefix="legal_agent_doc_") as temp_dir:
+            docx_path = self._convert_doc_to_docx(file_path, Path(temp_dir))
+            return self.extract_text_from_docx(docx_path)
 
     def extract_text_from_pdf(self, file_path: Path) -> str:
         """
@@ -225,16 +311,18 @@ class DocumentLoader:
 
         if suffix == ".docx":
             raw_text = self.extract_text_from_docx(path)
+        elif suffix == ".doc":
+            raw_text = self.extract_text_from_doc(path)
         elif suffix == ".pdf":
             raw_text = self.extract_text_from_pdf(path)
         elif suffix in self.SUPPORTED_IMAGE_EXTS:
             print(f"[*] 检测到图片格式合同 ({suffix})，正在启动 OCR 文本识别...", flush=True)
             raw_text = self.extract_text_from_image(path)
-        elif suffix in [".txt", ".md"]:
+        elif suffix in self.SUPPORTED_TEXT_EXTS:
             with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 raw_text = f.read()
         else:
-            supported = [".docx", ".pdf", ".txt"] + list(self.SUPPORTED_IMAGE_EXTS)
+            supported = sorted(self.SUPPORTED_WORD_EXTS | {".pdf"} | self.SUPPORTED_TEXT_EXTS | self.SUPPORTED_IMAGE_EXTS)
             raise ValueError(f"不支持的文件格式: {suffix}，当前支持格式: {supported}")
 
         return self._normalize_text(raw_text)

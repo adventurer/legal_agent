@@ -216,7 +216,10 @@ with st.container():
     st.markdown("#### 📄 待审查合同数据源")
     top_col1, top_col2 = st.columns([1, 2], gap="medium")
     with top_col1:
-        uploaded_file = st.file_uploader("上传合同文件 (Word / PDF / 图片 / TXT)", type=["docx", "pdf", "png", "jpg", "jpeg", "webp", "txt"])
+        uploaded_file = st.file_uploader(
+            "上传合同文件 (Word / PDF / 图片 / TXT)",
+            type=["docx", "doc", "pdf", "png", "jpg", "jpeg", "webp", "txt"],
+        )
         if uploaded_file is not None and st.session_state.get("last_uploaded_name") != uploaded_file.name:
             with st.spinner("正在执行多模态解析与条款切分..."):
                 res = upload_contract_file(uploaded_file, st.session_state.session_id)

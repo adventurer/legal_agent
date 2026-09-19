@@ -22,6 +22,7 @@ from typing import Optional, Dict, Any, List
 
 import re
 import uuid
+import secrets
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -31,8 +32,14 @@ from sse_starlette.sse import EventSourceResponse
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
-from configs.config import GATEWAY_HOST, GATEWAY_PORT, DATA_DIR, AGENT_CONFIG
-from core.schemas import ReviewRequest, AgentExecutionResult, ContractReviewReport
+from configs.config import (
+    GATEWAY_HOST,
+    GATEWAY_PORT,
+    DATA_DIR,
+    AGENT_CONFIG,
+    MAX_UPLOAD_BYTES,
+)
+from core.schemas import ReviewRequest, AgentExecutionResult
 from core.prompts import (
     AGENT_SYSTEM_PROMPT,
     USER_CONTRACT_INPUT_TEMPLATE,
@@ -43,27 +50,12 @@ from core.prompts import (
 from core.agent_loop import ContractReviewAgent, extract_action
 from services.doc_loader import DocumentLoader
 from gateway.session_manager import session_manager
+from services.report_parser import clean_report_content, is_final_report
 
 # 模型上下文窗口规格定义（默认参考 8192 窗口）
 MODEL_MAX_CONTEXT = AGENT_CONFIG.get("max_context_tokens", 8192)
 CONTEXT_THRESHOLD_95 = int(MODEL_MAX_CONTEXT * 0.95)  # 95% 输入水位线
 OUTPUT_MAX_TOKENS = 4096
-
-
-class LocalClause:
-    def __init__(self, index: int, title: str, content: str, type: str = "article"):
-        self.index = index
-        self.title = title
-        self.content = content
-        self.type = type
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "index": self.index,
-            "title": self.title,
-            "content": self.content,
-            "type": self.type,
-        }
 
 
 app = FastAPI(
@@ -82,27 +74,6 @@ app.add_middleware(
 
 agent_instance = ContractReviewAgent()
 doc_loader = DocumentLoader()
-
-
-def is_final_report(text: str) -> bool:
-    if not text:
-        return False
-    if any(k in text for k in ["Final:", "【最终结论】", "最终审查意见", "综合审查报告"]):
-        return True
-    report_signatures = [
-        "风险等级", "修改建议", "法律依据", "合规依据", "审查结论", "### 1.", "1. 违约", "1. 争议"
-    ]
-    return sum(1 for sig in report_signatures if sig in text) >= 2
-
-
-def clean_report_content(raw_text: str) -> str:
-    prefixes = ["Final:", "【最终结论】:", "【最终结论】", "最终审查意见:"]
-    cleaned = raw_text.strip()
-    for p in prefixes:
-        if p in cleaned:
-            cleaned = cleaned.split(p, 1)[-1].strip()
-            break
-    return cleaned
 
 
 def normalize_clauses_output(raw_clauses: Any) -> List[Dict[str, Any]]:
@@ -177,14 +148,32 @@ async def upload_contract(
     if not session_id or not session_manager.get_session(session_id):
         session_id = session_manager.create_session()
 
+    allowed_extensions = {
+        ".docx", ".doc", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".txt", ".md"
+    }
+    original_name = Path(file.filename or "").name
+    extension = Path(original_name).suffix.lower()
+    if extension not in allowed_extensions:
+        raise HTTPException(status_code=400, detail=f"不支持的文件格式: {extension or 'unknown'}")
+
     upload_dir = DATA_DIR / "uploads"
     upload_dir.mkdir(parents=True, exist_ok=True)
-    temp_file_path = upload_dir / f"{session_id}_{file.filename}"
+    temp_file_path = upload_dir / f"{session_id}_{secrets.token_hex(8)}{extension}"
 
     try:
-        content = await file.read()
+        bytes_read = 0
         with open(temp_file_path, "wb") as f:
-            f.write(content)
+            while True:
+                chunk = await file.read(1024 * 1024)
+                if not chunk:
+                    break
+                bytes_read += len(chunk)
+                if bytes_read > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"文件大小超过限制（最大 {MAX_UPLOAD_BYTES} 字节）",
+                    )
+                f.write(chunk)
 
         raw_clauses = doc_loader.load_and_split(temp_file_path)
         clauses_data = normalize_clauses_output(raw_clauses)
@@ -200,8 +189,10 @@ async def upload_contract(
                 "clauses": clauses_data,
             },
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"文件处理失败: {str(e)}")
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError, ImportError) as e:
+        raise HTTPException(status_code=422, detail=f"文件处理失败: {e}") from e
     finally:
         if temp_file_path.exists():
             try:
