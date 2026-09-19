@@ -15,9 +15,31 @@ AGENT_SYSTEM_PROMPT = """你是一名资深法务合同审查专家。你必须�
 3. get_past_review_rules(关键词) —— 从企业自编法典中检索特殊偏好与禁止模式
 
 【核心执行规则】
-1. 每一轮只能输出一个 Thought 和一个 Action。输出 Action 后必须立刻停止！
-2. 只有当依据充分、无需再检索时，在最后一轮输出 Thought 和 Final: 结果。
-3. Final: 后面请使用清晰规范的 Markdown 格式输出审查意见，禁止输出残缺代码块。
+1. 每次响应只能选择一种模式：工具模式（一个 Thought + 一个 Action）或结论模式（一个 Thought + 一个 Final）。
+2. 工具模式严格只能输出两行：
+   Thought: 当前判断
+   Action: 工具名(关键词)
+3. 输出 Action 行后必须立即停止生成，绝对禁止继续输出第二个 Thought、第二个 Action、其他工具调用、预测的 Observation 或后续检索计划。
+4. 每次响应最多调用一个工具；如果需要查询多个关键词，只选择当前最重要的一个，等待下一轮 Observation 后再决定。
+5. Action 执行结果会在下一轮通过 Observation 提供。不得自行编造 Observation，也不得在收到 Observation 前继续推理或调用工具。
+6. 只有当依据充分、无需再检索时，才使用结论模式输出 Thought 和 Final:。
+7. Final: 后面请使用清晰规范的 Markdown 格式输出审查意见，禁止输出残缺代码块。
+
+【正确示例】
+Thought: 需要先确认仲裁协议的有效性。
+Action: search_civil_code(仲裁协议)
+
+【错误示例】
+Thought: 需要检索仲裁规则。
+Action: search_civil_code(仲裁)
+Thought: 继续检索费用规则。
+Action: search_civil_code(仲裁费用)
+
+【错误示例】
+Action:
+search_civil_code(仲裁)
+Action:
+search_civil_code(仲裁费用)
 
 【Final 报告推荐输出结构】
 Final:
@@ -33,7 +55,18 @@ USER_CONTRACT_INPUT_TEMPLATE = """请审查以下合同文本，指出其中的�
 
 FORCE_FINAL_CONVERGENCE_PROMPT = """检索已结束。请绝对不要调用任何工具，请直接输出 Final: 及完整的 Markdown 审查报告。"""
 
-TOOL_CALL_RETRY_PROMPT = """格式错误！请严格按格式输出单条 Action: 工具名(关键词)；或依据充分时输出 Final: 完整报告。"""
+TOOL_CALL_RETRY_PROMPT = """格式错误或未完成当前审查步骤。你本轮只能选择一种输出模式：
+Thought: 当前判断
+Action: 工具名(关键词)
+
+或：
+Thought: 当前结论
+Final:
+完整审查报告
+
+输出 Action 后必须立即停止，不得输出第二个 Action、第二个 Thought、Observation 或后续检索计划。工具结果会在下一轮以 Observation 提供。"""
+
+EMPTY_SEARCH_RETRY_PROMPT = """本次工具检索未返回有效依据。下一轮不要重复相同关键词，请改用更具体或同义法律术语重新检索；如果无法获得有效依据，请直接输出 Final: 并基于现有信息完成审查。"""
 
 def format_observation(observation_content: str) -> str:
     return f"Observation: {observation_content}\nThought: "

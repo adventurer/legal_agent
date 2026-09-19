@@ -33,6 +33,9 @@ pip install fastapi uvicorn sse-starlette python-multipart
 # webui
 pip install streamlit httpx-sse
 
+# 审查意见导出
+# Streamlit 支持下载 Markdown (.md) 和 Word (.docx) 两种格式
+
 # 4. 创建项目专属目录并进入
 mkdir -p ~/legal_agent_lab && cd ~/legal_agent_lab
 

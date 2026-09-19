@@ -23,6 +23,7 @@ import streamlit as st
 from services.report_parser import clean_report_content
 from web.api_client import check_gateway_health as fetch_gateway_health
 from web.api_client import upload_contract_file as send_contract_file
+from web.report_exporter import report_to_docx
 from web.sse_client import stream_contract_review
 
 API_BASE_URL = "http://127.0.0.1:9000"
@@ -323,7 +324,11 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
                 )
             elif event == "final_report":
                 extracted_final = data.get("raw_report", "")
-                status_box.update(label="✅ 审查完成！", state="complete")
+                status_box.update(
+                    label="✅ 审查完成！",
+                    state="complete",
+                    expanded=False,
+                )
             elif event == "done":
                 break
 
@@ -415,7 +420,11 @@ def execute_concurrent_clause_review(clauses_to_review: List[Dict[str, Any]], ma
             card = status_placeholders.get(c_idx)
             if card:
                 if res["success"]:
-                    card.update(label=f"✅ 完成: {res['title']}", state="complete", expanded=False)
+                    card.update(
+                        label=f"✅ 完成: {res['title']}",
+                        state="complete",
+                        expanded=False,
+                    )
                     for l in res["logs"][-3:]:
                         card.write(f"- {l}")
                 else:
@@ -495,12 +504,27 @@ with st.container():
         st.markdown('</div>', unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
-        st.download_button(
-            label="📥 导出法务审查意见报告 (Markdown 格式)",
-            data=st.session_state.final_report,
-            file_name=f"contract_review_{int(time.time())}.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
+        export_col1, export_col2 = st.columns(2)
+        export_filename = f"contract_review_{int(time.time())}"
+        with export_col1:
+            st.download_button(
+                label="📥 导出 Markdown 报告",
+                data=st.session_state.final_report,
+                file_name=f"{export_filename}.md",
+                mime="text/markdown",
+                use_container_width=True,
+            )
+        with export_col2:
+            try:
+                docx_report = report_to_docx(st.session_state.final_report)
+                st.download_button(
+                    label="📄 导出 Word 报告",
+                    data=docx_report,
+                    file_name=f"{export_filename}.docx",
+                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    use_container_width=True,
+                )
+            except RuntimeError as exc:
+                st.error(str(exc))
     elif not st.session_state.is_reviewing:
         st.info("💡 操作指引：确认待审合同后，点击【开始执行合同智能合规审查】或展开条款明细点击【单独审查】。")
