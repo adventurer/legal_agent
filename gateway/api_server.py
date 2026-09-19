@@ -22,7 +22,6 @@ from typing import Optional, Dict, Any, List
 
 import re
 import uuid
-import secrets
 import uvicorn
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,6 +49,7 @@ from core.prompts import (
 from core.agent_loop import ContractReviewAgent, extract_action
 from services.doc_loader import DocumentLoader
 from gateway.session_manager import session_manager
+from gateway.upload_service import create_temp_upload_path, get_safe_extension, save_upload_file
 from services.report_parser import clean_report_content, is_final_report
 
 # 模型上下文窗口规格定义（默认参考 8192 窗口）
@@ -148,32 +148,12 @@ async def upload_contract(
     if not session_id or not session_manager.get_session(session_id):
         session_id = session_manager.create_session()
 
-    allowed_extensions = {
-        ".docx", ".doc", ".pdf", ".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff", ".txt", ".md"
-    }
-    original_name = Path(file.filename or "").name
-    extension = Path(original_name).suffix.lower()
-    if extension not in allowed_extensions:
-        raise HTTPException(status_code=400, detail=f"不支持的文件格式: {extension or 'unknown'}")
-
+    extension = get_safe_extension(file.filename or "")
     upload_dir = DATA_DIR / "uploads"
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    temp_file_path = upload_dir / f"{session_id}_{secrets.token_hex(8)}{extension}"
+    temp_file_path = create_temp_upload_path(upload_dir, session_id, extension)
 
     try:
-        bytes_read = 0
-        with open(temp_file_path, "wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                bytes_read += len(chunk)
-                if bytes_read > MAX_UPLOAD_BYTES:
-                    raise HTTPException(
-                        status_code=413,
-                        detail=f"文件大小超过限制（最大 {MAX_UPLOAD_BYTES} 字节）",
-                    )
-                f.write(chunk)
+        await save_upload_file(file, temp_file_path, MAX_UPLOAD_BYTES)
 
         raw_clauses = doc_loader.load_and_split(temp_file_path)
         clauses_data = normalize_clauses_output(raw_clauses)

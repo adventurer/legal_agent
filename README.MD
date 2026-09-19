@@ -53,3 +53,12 @@ streamlit run web/app_ui.py --server.port 8501
 # MAX_UPLOAD_BYTES=20971520      # 合同上传大小上限，默认 20 MiB
 # VLLM_MAX_MODEL_LEN=4096        # 模型上下文长度
 # DEFAULT_MODEL_KEY 由 configs/config.py 统一维护，启动器默认使用 qwen2.5-7b-awq
+
+# 模块职责
+# services/doc_loader.py 仅负责多格式文档读取与文本归一化
+# services/clause_splitter.py 负责合同条款切分
+# services/document_models.py 定义文档领域模型
+# services/mock_contract_generator.py 负责生成解析测试素材
+# gateway/upload_service.py 负责上传校验与临时文件写入
+# web/api_client.py 负责 Streamlit 到 FastAPI 网关的 HTTP 调用
+# archive/ 保存已确认不再作为运行入口的历史副本

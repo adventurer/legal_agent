@@ -4,20 +4,21 @@
 文件名: services/doc_loader.py
 职责:
 1. 多源合同解析：支持 Word (.docx, .doc)、PDF、图片与纯文本
-2. 生产级双轨 PDF 提取：优先毫秒级提取矢量文字；若为扫描件/图片页，自动光栅化为高分图片送入 RapidOCR
-3. 层次化防截断状态机：按“第一条/一、”等主条款聚合；严禁将 1.1、(1) 等款项截断；自动切分前言与签署盖章页
-4. 自带四模态测试数据生成引擎：自动生成 TXT/DOCX/PNG/PDF 并跑通完整闭环测试
+2. 生产级双轨 PDF 提取：优先提取矢量文字；扫描件自动进入 OCR 兜底
+3. 将解析后的文本交给独立条款切分器处理
 """
 
 import os
-import re
 import io
-import sys
+import re
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Any
+
+from services.clause_splitter import ClauseSplitter
+from services.document_models import ContractClause
 
 # 1. 基础文档处理依赖
 try:
@@ -40,9 +41,9 @@ except ImportError:
 
 # 2. 图片与 OCR 依赖
 try:
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image
 except ImportError:
-    Image, ImageDraw, ImageFont = None, None, None
+    Image = None
 
 try:
     from rapidocr_onnxruntime import RapidOCR
@@ -56,40 +57,8 @@ except ImportError:
     pytesseract = None
 
 
-class ContractClause:
-    """单个合同条款结构体"""
-    def __init__(self, index: int, title: str, content: str, raw_text: str, clause_type: str = "article"):
-        self.index = index
-        self.title = title
-        self.content = content
-        self.raw_text = raw_text
-        self.clause_type = clause_type  # preamble (前言), article (正文条款), sign_page (盖章页)
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            "index": self.index,
-            "title": self.title,
-            "content": self.content,
-            "raw_text": self.raw_text,
-            "type": self.clause_type
-        }
-
-    def __repr__(self) -> str:
-        return f"<Clause {self.index} [{self.clause_type}]: {self.title[:18]}... ({len(self.content)} 字)>"
-
-
 class DocumentLoader:
     """合同文档多模态解析与切分器 (工业增强版)"""
-
-    # 一级大条款正则：严格锚定一级条款（如“第一条 违约责任”、“一、 合作事项”）
-    MAJOR_CLAUSE_PATTERN = re.compile(
-        r"^(?:第[一二三四五六七八九十百千万\d]+条|\b[一二三四五六七八九十百]+[、. ])\s*(.*)$"
-    )
-
-    # 签署盖章页识别正则
-    SIGN_PAGE_PATTERN = re.compile(
-        r"^(?:（以下无正文|以下无正文|双方签署|协议签署盖章页|甲方（盖章）|乙方（盖章）|甲方\(盖章\)|乙方\(盖章\))"
-    )
 
     SUPPORTED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tiff"}
     SUPPORTED_WORD_EXTS = {".docx", ".doc"}
@@ -342,239 +311,9 @@ class DocumentLoader:
         2. 1.1、1.2、(1)、(2) 等子项全部合并保留在所属大条款正文中，防语义碎裂；
         3. 完整识别并隔离前言（PREAMBLE）与签署盖章页（SIGN_PAGE）。
         """
-        lines = [line.strip() for line in full_text.splitlines() if line.strip()]
-        clauses: List[ContractClause] = []
-
-        state = "PREAMBLE"  # PREAMBLE -> BODY -> SIGN_PAGE
-        preamble_lines = []
-        current_title = ""
-        current_lines = []
-        sign_page_lines = []
-        counter = 0
-
-        for line in lines:
-            # 1. 盖章签署页判定
-            if self.SIGN_PAGE_PATTERN.search(line):
-                state = "SIGN_PAGE"
-                sign_page_lines.append(line)
-                continue
-
-            if state == "SIGN_PAGE":
-                sign_page_lines.append(line)
-                continue
-
-            # 2. 一级主条款判定
-            major_match = self.MAJOR_CLAUSE_PATTERN.match(line)
-            if major_match:
-                if state == "PREAMBLE":
-                    if preamble_lines:
-                        counter += 1
-                        clauses.append(ContractClause(
-                            index=counter,
-                            title="合同前言与主体信息",
-                            content="\n".join(preamble_lines).strip(),
-                            raw_text="\n".join(preamble_lines).strip(),
-                            clause_type="preamble"
-                        ))
-                    state = "BODY"
-
-                elif state == "BODY" and current_title:
-                    counter += 1
-                    body_content = "\n".join(current_lines).strip()
-                    clauses.append(ContractClause(
-                        index=counter,
-                        title=current_title,
-                        content=body_content,
-                        raw_text=f"{current_title}\n{body_content}",
-                        clause_type="article"
-                    ))
-                    current_lines = []
-
-                current_title = line
-            else:
-                # 3. 子条款合并处理
-                if state == "PREAMBLE":
-                    preamble_lines.append(line)
-                elif state == "BODY":
-                    # 核心：小款（如 1.1、2.2）或 (1)、(2) 强制合并在当前大条款内
-                    current_lines.append(line)
-
-        # 归档最后一个正文条款
-        if current_title and current_lines:
-            counter += 1
-            body_content = "\n".join(current_lines).strip()
-            clauses.append(ContractClause(
-                index=counter,
-                title=current_title,
-                content=body_content,
-                raw_text=f"{current_title}\n{body_content}",
-                clause_type="article"
-            ))
-
-        # 归档盖章页
-        if sign_page_lines:
-            counter += 1
-            sign_content = "\n".join(sign_page_lines).strip()
-            clauses.append(ContractClause(
-                index=counter,
-                title="协议签署与盖章页",
-                content=sign_content,
-                raw_text=sign_content,
-                clause_type="sign_page"
-            ))
-
-        # 全文未分条款时的降级兜底
-        if not clauses and full_text.strip():
-            clauses.append(ContractClause(
-                index=1,
-                title="合同正文",
-                content=full_text.strip(),
-                raw_text=full_text.strip(),
-                clause_type="article"
-            ))
-
-        return clauses
+        return ClauseSplitter.split(full_text)
 
     def load_and_split(self, file_path: str | Path) -> List[ContractClause]:
         """对外主接口"""
         text = self.extract_text(file_path)
         return self.split_into_clauses(text)
-
-
-# ==================== 测试套件：动态生成测试文件引擎 ====================
-
-class MockContractGenerator:
-    """动态生成四种类型合同测试用例（TXT, DOCX, PNG, PDF）"""
-
-    SAMPLE_CONTRACT_TEXT = (
-        "高端智能制造设备采购与维保服务协议\n\n"
-        "合同编号：HT-202609-XYZ8890\n"
-        "甲方：北京华创智能科技股份有限公司\n"
-        "乙方：苏州精工自动化系统工程有限公司\n\n"
-        "第一条 交付期限与违约金\n"
-        "1.1 设备明细：乙方须向甲方提供6轴工业机器人12台。\n"
-        "1.2 逾期交付：乙方逾期交付的，每日应按合同总金额的 5% 向甲方支付违约金。\n\n"
-        "第二条 货款结算与付款周期\n"
-        "2.1 验收标准：经连续 72 小时无故障运行后签署最终合格单。\n"
-        "2.2 货款分期结算：\n"
-        "（1）首付款：生效后支付 15%；\n"
-        "（2）尾款：视甲方内部季度资金周转充裕情况安排支付，不受商业惯例限制。\n\n"
-        "第三条 争议解决与独任仲裁\n"
-        "3.1 因本合同引起的一切争议，由甲方指定的单方独任仲裁员在其个人办公场所内裁决，裁决为终局。\n\n"
-        "（以下无正文，为协议签署盖章页）\n"
-        "甲方（盖章）：北京华创智能科技股份有限公司\n"
-        "乙方（盖章）：苏州精工自动化系统工程有限公司"
-    )
-
-    @classmethod
-    def generate_all(cls, output_dir: Path) -> Dict[str, Path]:
-        output_dir.mkdir(parents=True, exist_ok=True)
-        paths = {}
-
-        # 1. 生成纯文本文件 (.txt)
-        txt_path = output_dir / "test_contract.txt"
-        txt_path.write_text(cls.SAMPLE_CONTRACT_TEXT, encoding="utf-8")
-        paths["txt"] = txt_path
-
-        # 2. 生成 Word 文件 (.docx)
-        if Document is not None:
-            docx_path = output_dir / "test_contract.docx"
-            doc = Document()
-            for line in cls.SAMPLE_CONTRACT_TEXT.split("\n"):
-                if line.strip():
-                    doc.add_paragraph(line.strip())
-            doc.save(str(docx_path))
-            paths["docx"] = docx_path
-
-        # 3. 生成图片文件 (.png)
-        if Image is not None and ImageDraw is not None:
-            img_path = output_dir / "test_contract.png"
-            img = Image.new("RGB", (950, 750), color=(255, 255, 255))
-            draw = ImageDraw.Draw(img)
-
-            font = None
-            font_candidates = [
-                "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
-                "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-                "simsun.ttc",
-                "msyh.ttc",
-            ]
-            for font_file in font_candidates:
-                if os.path.exists(font_file):
-                    try:
-                        font = ImageFont.truetype(font_file, 16)
-                        break
-                    except Exception:
-                        continue
-            if font is None:
-                font = ImageFont.load_default()
-
-            y = 25
-            for line in cls.SAMPLE_CONTRACT_TEXT.split("\n"):
-                if line.strip():
-                    draw.text((35, y), line.strip(), fill=(0, 0, 0), font=font)
-                    y += 26
-                else:
-                    y += 10
-
-            img.save(str(img_path))
-            paths["image"] = img_path
-
-        # 4. 生成原生 PDF 文件 (.pdf)
-        pdf_path = output_dir / "test_contract.pdf"
-        if fitz is not None:
-            # 优先用 PyMuPDF 直接构建测试 PDF，免除额外三方库依赖
-            doc_pdf = fitz.open()
-            page = doc_pdf.new_page(width=595, height=842)  # A4 页面
-            text_point = fitz.Point(40, 50)
-            page.insert_text(text_point, cls.SAMPLE_CONTRACT_TEXT, fontsize=11)
-            doc_pdf.save(str(pdf_path))
-            doc_pdf.close()
-            paths["pdf"] = pdf_path
-        else:
-            try:
-                from reportlab.pdfgen import canvas
-                from reportlab.lib.pagesizes import letter
-                c = canvas.Canvas(str(pdf_path), pagesize=letter)
-                y = 750
-                for line in cls.SAMPLE_CONTRACT_TEXT.split("\n"):
-                    if line.strip():
-                        c.drawString(40, y, line.strip())
-                        y -= 22
-                c.save()
-                paths["pdf"] = pdf_path
-            except ImportError:
-                pass
-
-        return paths
-
-
-# ==================== 自动化全闭环测试 ====================
-if __name__ == "__main__":
-    print("=" * 70)
-    print(" 🚀 DocumentLoader 增强版自检：多模态合同提取与层次化切片测试")
-    print("=" * 70)
-
-    test_dir = Path(tempfile.gettempdir()) / "legal_doc_loader_test_v3"
-    print(f"[*] 正在自动生成测试套件到临时目录: {test_dir}")
-    generated_files = MockContractGenerator.generate_all(test_dir)
-
-    for f_type, f_path in generated_files.items():
-        print(f"  - [{f_type.upper()}] 成功构建: {f_path.name}")
-
-    print("\n" + "=" * 70)
-    print("[*] 开始执行各文件格式解析与条款切片验证:")
-    loader = DocumentLoader()
-
-    for f_type, f_path in generated_files.items():
-        print(f"\n>>> 正在验证 [{f_type.upper()}] 格式: {f_path.name}")
-        try:
-            clauses = loader.load_and_split(f_path)
-            print(f"    [成功] 解析出 {len(clauses)} 个语义结构单元")
-            for c in clauses:
-                print(f"     * [{c.clause_type.upper():<9}] 序号 {c.index}: {c.title:<22} (正文 {len(c.content)} 字符)")
-        except Exception as e:
-            print(f"    [失败] 发生异常: {e}")
-
-    print("\n" + "=" * 70)
-    print("全部测试流程执行完毕！")

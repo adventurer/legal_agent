@@ -24,6 +24,8 @@ import httpx
 from httpx_sse import connect_sse
 import streamlit as st
 from services.report_parser import clean_report_content
+from web.api_client import check_gateway_health as fetch_gateway_health
+from web.api_client import upload_contract_file as send_contract_file
 
 API_BASE_URL = "http://127.0.0.1:9000"
 
@@ -134,23 +136,14 @@ if "circuit_breaks" not in st.session_state:
 # ==================== 3. 辅助函数 ====================
 def check_gateway_health() -> Dict[str, Any]:
     try:
-        resp = httpx.get(f"{API_BASE_URL}/health", timeout=2.0)
-        if resp.status_code == 200:
-            return resp.json()
+        return fetch_gateway_health(API_BASE_URL)
     except Exception:
-        pass
-    return {"status": "unreachable"}
+        return {"status": "unreachable"}
 
 
 def upload_contract_file(uploaded_file, session_id: Optional[str]) -> Optional[Dict[str, Any]]:
     try:
-        files = {"file": (uploaded_file.name, uploaded_file.getvalue(), uploaded_file.type)}
-        data = {"session_id": session_id} if session_id else {}
-        resp = httpx.post(f"{API_BASE_URL}/api/v1/contract/upload", files=files, data=data, timeout=30.0)
-        if resp.status_code == 200:
-            return resp.json()
-        else:
-            st.error(f"后端解析文件异常 [{resp.status_code}]: {resp.text}")
+        return send_contract_file(API_BASE_URL, uploaded_file, session_id)
     except Exception as e:
         st.error(f"上传文件网络请求失败: {e}")
     return None
