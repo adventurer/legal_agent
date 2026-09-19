@@ -1,0 +1,93 @@
+================================================================================
+           Legal Agent Lab - Conda 环境与项目跨机器移植指南
+================================================================================
+
+在深度学习与 AI 工程项目中，由于包含 vLLM、PyTorch 和 CUDA 相关的底层 C/C++ 动态链接库，
+直接使用 `conda env export > environment.yml` 容易因硬编码系统绝对路径或跨机器驱动微小差异
+导致解析失败。
+
+推荐采用成熟的【两阶段解耦导出法】完成迁移。
+
+--------------------------------------------------------------------------------
+第一步：在当前开发机导出环境清单
+--------------------------------------------------------------------------------
+
+在当前正常运行的 WSL2 / Linux 终端中，确保已激活目标环境：
+$ conda activate legal_agent
+
+1. 导出纯净依赖清单 (推荐)
+   在项目根目录下运行，导出纯净版 pip 依赖清单（滤除本地临时编译路径）：
+   $ pip list --format=freeze > requirements.txt
+
+2. 导出 Conda 顶层依赖 (备用)
+   生成不包含操作系统具体 build hash 的跨平台环境配置文件：
+   $ conda env export --no-builds > environment_cross.yml
+
+--------------------------------------------------------------------------------
+第二步：在新机器上一键重建与安装
+--------------------------------------------------------------------------------
+
+在新机器（需具备 NVIDIA 显卡与驱动的 Linux/WSL2 环境）上按顺序执行：
+
+1. 安装系统级依赖（中文字体与必要编译工具）
+   $ sudo apt update && sudo apt install -y fonts-wqy-microhei fonts-wqy-zenhei git wget
+
+2. 创建并激活干净的 Python 3.10 环境
+   $conda create -n legal_agent python=3.10 -y$ conda activate legal_agent
+
+3. 安装适配新机器硬件的 PyTorch 与全部依赖库
+   (推荐根据新机器的 CUDA 驱动版本在线拉取对应轮子，避免机械复制导致的驱动冲突)
+
+   方式 A：标准按序安装 (推荐，兼顾 CUDA 12.1+)
+   $pip install torch --index-url https://download.pytorch.org/whl/cu121$ pip install -r requirements.txt
+
+   方式 B：脚本极速全新安装
+   $ pip install \
+       vllm \
+       openai \
+       httpx \
+       httpx-sse \
+       pydantic \
+       pypdf \
+       python-docx \
+       rapidocr-onnxruntime \
+       pillow \
+       fastapi \
+       uvicorn \
+       sse-starlette \
+       python-multipart \
+       streamlit
+
+--------------------------------------------------------------------------------
+第三步：拷贝项目工程资产
+--------------------------------------------------------------------------------
+
+由于模型权重较大且 SQLite 包含初始业务规则，迁移时请注意以下文件的拷贝：
+
+1. 模型权重目录 (通常约 4~5GB，通过移动硬盘或局域网 scp 复制)
+   目标路径: legal_agent_lab/models/Qwen2.5-7B-Instruct-AWQ/
+
+2. 权威参考文档 (打包复制)
+   目标路径: legal_agent_lab/reference_docs/*.pdf
+
+3. SQLite 数据库 (随项目复制，保留已初始化的企业自编法典与历史红线)
+   目标路径: legal_agent_lab/data/rule_book.db
+
+4. 核心工程业务源码 (Git 同步或压缩包复制)
+   包含目录: configs/、core/、services/、gateway/、web/
+
+--------------------------------------------------------------------------------
+第四步：在新电脑上进行自检验证
+--------------------------------------------------------------------------------
+
+项目代码与模型就绪后，执行以下自测命令确认环境与硬件链路完全通畅：
+
+1. 验证底层企业法典与多模态文档切分器
+   $ python services/rule_book.py
+   $ python services/doc_loader.py
+
+2. 验证 vLLM 推理引擎能否正常加载 AWQ 模型权重
+   $ python server/vllm_launcher.py
+
+自测全部输出通过即代表新机器环境移植成功，可正常拉起 Gateway 与 Streamlit 工作台。
+================================================================================
