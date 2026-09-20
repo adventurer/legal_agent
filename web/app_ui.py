@@ -175,6 +175,19 @@ def render_reasoning_text(text: str) -> str:
     return render_thought_box(visible_text or "模型正在整理最终审查报告...")
 
 
+@st.dialog("条款内容")
+def show_clause_content(title: str, content: str) -> None:
+    """Display the complete clause text in a modal dialog."""
+    st.markdown(f"#### {title}")
+    st.text_area(
+        "条款正文",
+        value=content or "该条款暂无正文内容。",
+        height=360,
+        disabled=True,
+        label_visibility="collapsed",
+    )
+
+
 # ==================== 4. 顶部控制栏 ====================
 header_col, status_col = st.columns([3, 1])
 with header_col:
@@ -258,7 +271,17 @@ with st.container():
                 with col_target:
                     c_col1, c_col2 = st.columns([4, 1])
                     with c_col1:
-                        st.markdown(f"**`#{c.get('index')}` {c.get('title')}**")
+                        clause_index = c.get("index")
+                        clause_title = c.get("title", f"条款 {clause_index}")
+                        if st.button(
+                            f"#{clause_index} {clause_title}",
+                            key=f"btn_clause_content_{clause_index}",
+                            use_container_width=True,
+                        ):
+                            show_clause_content(
+                                clause_title,
+                                c.get("content", ""),
+                            )
                     with c_col2:
                         if st.button("单独审查", key=f"btn_single_{c.get('index')}"):
                             selected_clause_idx = c.get("index")
