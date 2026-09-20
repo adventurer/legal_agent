@@ -68,5 +68,17 @@ Final:
 
 EMPTY_SEARCH_RETRY_PROMPT = """本次工具检索未返回有效依据。下一轮不要重复相同关键词，请改用更具体或同义法律术语重新检索；如果无法获得有效依据，请直接输出 Final: 并基于现有信息完成审查。"""
 
+CONTRACT_REWRITE_PROMPT = """你是合同修订专家。请根据审查报告，只修改下方指定的合同条款。
+不得修改未提供的条款，不得改变合同主体、金额、日期和其他未被审查意见要求修改的事实。
+必须返回严格 JSON，不要输出 Markdown 或代码围栏：
+{{"revised_clauses":[{{"index":1,"revised_text":"修订后的完整条款正文","change_reason":"修改原因"}}]}}
+
+指定条款：
+{clauses}
+
+审查报告：
+{review_report}
+"""
+
 def format_observation(observation_content: str) -> str:
     return f"Observation: {observation_content}\nThought: "

@@ -36,6 +36,11 @@ pip install streamlit httpx-sse
 # 审查意见导出
 # Streamlit 支持下载 Markdown (.md) 和 Word (.docx) 两种格式
 
+# 合同修订
+# 审查完成后，在条款明细中勾选“纳入合同修订”，
+# 点击“根据选中条款和审查意见生成修订合同”即可生成新版合同。
+# 未选中的条款保持原文，并支持 Markdown / Word 导出。
+
 # API 调试
 # 启动 API 服务时增加 --debug，可在控制台打印每轮 messages、请求参数、模型响应和工具结果：
 python gateway/api_server.py --debug

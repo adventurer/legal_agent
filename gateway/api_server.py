@@ -37,7 +37,12 @@ from configs.config import (
     AGENT_CONFIG,
     MAX_UPLOAD_BYTES,
 )
-from core.schemas import ReviewRequest, AgentExecutionResult
+from core.schemas import (
+    ReviewRequest,
+    AgentExecutionResult,
+    ContractRewriteRequest,
+    ContractRewriteResponse,
+)
 from core.agent_loop import ContractReviewAgent
 from services.doc_loader import DocumentLoader
 from gateway.session_manager import session_manager
@@ -49,6 +54,7 @@ from gateway.review_orchestrator import (
     ReviewOrchestrator,
     generate_kb_deficit_recommendation,
 )
+from services.contract_rewriter import rewrite_selected_clauses
 
 app = FastAPI(
     title="Legal Agent Lab API Gateway",
@@ -161,6 +167,20 @@ async def review_contract_stream(request: ReviewRequest):
     return EventSourceResponse(
         review_orchestrator.stream(request.contract_text, limit_turns, task_label)
     )
+
+
+@app.post("/api/v1/contract/rewrite", response_model=ContractRewriteResponse)
+async def rewrite_contract(request: ContractRewriteRequest):
+    try:
+        result = rewrite_selected_clauses(
+            agent_instance,
+            request.clauses,
+            request.review_report,
+            request.selected_indices,
+        )
+        return result
+    except (ValueError, KeyError, TypeError) as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 def main():

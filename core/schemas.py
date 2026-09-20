@@ -110,6 +110,27 @@ class ReviewRequest(BaseModel):
     )
 
 
+class ContractRevisionItem(BaseModel):
+    """用户确认后用于重写的单个合同条款。"""
+    index: int
+    title: str
+    original_text: str
+    suggested_revision: str
+
+
+class ContractRewriteRequest(BaseModel):
+    """按用户选择的条款生成修订版合同。"""
+    clauses: List[Dict[str, Any]] = Field(..., min_length=1)
+    review_report: str = Field(..., min_length=1)
+    selected_indices: List[int] = Field(default_factory=list)
+
+
+class ContractRewriteResponse(BaseModel):
+    """修订版合同及逐条修改结果。"""
+    contract_text: str
+    revised_clauses: List[Dict[str, Any]] = Field(default_factory=list)
+
+
 class AgentExecutionResult(BaseModel):
     """核心 Agent Loop 执行完毕后的完整状态容器"""
     status: str = Field(
