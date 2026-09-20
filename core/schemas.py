@@ -108,6 +108,10 @@ class ReviewRequest(BaseModel):
         default=True, 
         description="是否启用打字机流式输出"
     )
+    debug: Optional[bool] = Field(
+        default=False,
+        description="是否在 API 服务控制台打印与大模型交互的详细内容"
+    )
 
 
 class AgentExecutionResult(BaseModel):

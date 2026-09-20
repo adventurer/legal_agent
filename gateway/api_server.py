@@ -158,7 +158,12 @@ async def review_contract_stream(request: ReviewRequest):
     )
     task_label = clause_title_match.group(1).strip() if clause_title_match else f"Task-{uuid.uuid4().hex[:6]}"
     return EventSourceResponse(
-        review_orchestrator.stream(request.contract_text, limit_turns, task_label)
+        review_orchestrator.stream(
+            request.contract_text,
+            limit_turns,
+            task_label,
+            debug=bool(request.debug),
+        )
     )
 
 

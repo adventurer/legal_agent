@@ -174,6 +174,7 @@ def render_reasoning_text(text: str) -> str:
     visible_text = visible_text.strip()
     return render_thought_box(visible_text or "模型正在整理最终审查报告...")
 
+
 # ==================== 4. 顶部控制栏 ====================
 header_col, status_col = st.columns([3, 1])
 with header_col:
@@ -437,7 +438,7 @@ def execute_concurrent_clause_review(clauses_to_review: List[Dict[str, Any]], ma
     aggregated_reports = [f"### 条款 {r['index']}: {r['title']}\n\n{r['report']}\n\n---" for r in results]
 
     st.session_state.is_reviewing = False
-    return "# 📋 综合合同审查终审报告 (多路并发精审汇总)\n\n" + "\n\n".join(aggregated_reports)
+    return "# 综合合同审查终审报告 (多路并发精审汇总)\n\n" + "\n\n".join(aggregated_reports)
 
 
 # ==================== 8. 下部：审查轨迹与展示 ====================
@@ -469,7 +470,7 @@ with st.container():
                         if report_part:
                             aggregated_reports.append(f"### 条款 {clause['index']}: {clause['title']}\n\n{report_part}\n\n---")
                     progress_bar.empty()
-                    st.session_state.final_report = "# 📋 综合合同审查终审报告 (逐条精审汇总)\n\n" + "\n\n".join(aggregated_reports)
+                    st.session_state.final_report = "# 综合合同审查终审报告 (逐条精审汇总)\n\n" + "\n\n".join(aggregated_reports)
                     st.rerun()
                 else:
                     final_aggregated = execute_concurrent_clause_review(article_clauses, max_workers=concurrency)

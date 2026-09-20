@@ -87,7 +87,7 @@ class ReviewOrchestrator:
         self.agent = agent
 
     async def stream(
-        self, contract_text: str, max_turns: int, task_label: str
+        self, contract_text: str, max_turns: int, task_label: str, debug: bool = False
     ) -> AsyncGenerator[Dict[str, str], None]:
         max_search_budget = max(3, max_turns - 1)
         messages = [
@@ -171,6 +171,21 @@ class ReviewOrchestrator:
                     ),
                     "attempted_queries": history_queries,
                 })
+            if debug:
+                print(
+                    f"\n[DEBUG][{task_label}][轮次 {turn + 1}] "
+                    f"发送给大模型的 messages:\n"
+                    f"{json.dumps(messages, ensure_ascii=False, indent=2)}",
+                    flush=True,
+                )
+                print(
+                    f"[DEBUG][{task_label}][轮次 {turn + 1}] "
+                    f"请求参数: model={self.agent.model_name}, "
+                    f"temperature={AGENT_CONFIG.get('temperature', 0.0)}, "
+                    f"top_p={AGENT_CONFIG.get('top_p', 1.0)}, "
+                    f"max_tokens={current_max_tokens}, stream=True",
+                    flush=True,
+                )
             try:
                 stream_response = self.agent.client.chat.completions.create(
                     model=self.agent.model_name, messages=messages,
@@ -214,6 +229,13 @@ class ReviewOrchestrator:
                 return
 
             reply = "".join(reply_chunks).strip()
+            if debug:
+                print(
+                    f"\n[DEBUG][{task_label}][轮次 {turn + 1}] "
+                    f"大模型完整响应:\n{reply}\n"
+                    f"[DEBUG][{task_label}][轮次 {turn + 1}] 响应结束",
+                    flush=True,
+                )
             output_chars = len(reply)
             output_tokens = usage_completion_tokens or estimate_prompt_tokens([{"content": reply}])
             measured_input_tokens = usage_prompt_tokens or input_tokens
@@ -369,6 +391,14 @@ class ReviewOrchestrator:
                     observation = self.agent.tool_mapping[tool_name](tool_arg)
                 except Exception as exc:
                     observation = f"工具执行异常: {str(exc)}"
+                if debug:
+                    print(
+                        f"\n[DEBUG][{task_label}][轮次 {turn + 1}] 工具调用: "
+                        f"{tool_name}({tool_arg})\n"
+                        f"[DEBUG][{task_label}][轮次 {turn + 1}] 工具返回:\n"
+                        f"{observation}",
+                        flush=True,
+                    )
                 last_observation_empty = (
                     not observation.strip()
                     or "未检索到" in observation
