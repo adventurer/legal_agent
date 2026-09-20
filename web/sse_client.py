@@ -12,10 +12,16 @@ def stream_contract_review(
     contract_text: str,
     max_turns: int,
     timeout: float = 180.0,
+    debug: bool = False,
 ) -> Iterator[Dict[str, Any]]:
     """请求合同审查流，并将 SSE 事件转换为字典。"""
     with httpx.Client(timeout=timeout) as client:
-        payload = {"contract_text": contract_text, "max_turns": max_turns, "stream": True}
+        payload = {
+            "contract_text": contract_text,
+            "max_turns": max_turns,
+            "stream": True,
+            "debug": debug,
+        }
         with connect_sse(
             client,
             "POST",
