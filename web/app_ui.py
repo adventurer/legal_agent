@@ -269,7 +269,11 @@ with st.container():
 
     selected_clause_idx = None
     if st.session_state.clauses:
-        with st.expander(f"📑 条款结构化明细表 (共 {len(st.session_state.clauses)} 个单元)", expanded=False):
+        with st.expander(
+            f"📑 条款明细与合同修订 (共 {len(st.session_state.clauses)} 个单元)",
+            expanded=False,
+        ):
+            st.caption("点击条款标题查看全文；勾选需要根据审查意见修订的条款。")
             clause_cols = st.columns(2, gap="medium")
             for idx, c in enumerate(st.session_state.clauses):
                 col_target = clause_cols[idx % 2]
@@ -297,6 +301,68 @@ with st.container():
                         disabled=st.session_state.is_reviewing,
                     )
                     st.divider()
+
+            selected_revision_indices = [
+                int(c.get("index"))
+                for c in st.session_state.clauses
+                if st.session_state.get(f"rewrite_clause_{c.get('index')}", False)
+            ]
+            if not st.session_state.final_report:
+                st.info("完成合同审查后，可在此选择条款并生成修订合同。")
+            elif not selected_revision_indices:
+                st.warning("请选择至少一个“纳入合同修订”的条款。")
+            else:
+                if st.button(
+                    "📝 根据审查意见生成修订合同",
+                    type="secondary",
+                    use_container_width=True,
+                    disabled=st.session_state.is_reviewing,
+                ):
+                    with st.spinner("正在按选中条款生成修订合同..."):
+                        try:
+                            st.session_state.revised_contract = rewrite_contract(
+                                API_BASE_URL,
+                                st.session_state.clauses,
+                                st.session_state.final_report,
+                                selected_revision_indices,
+                            )
+                            st.success("修订合同生成完成，未选中的条款保持原文。")
+                        except Exception as exc:
+                            st.error(f"生成修订合同失败: {exc}")
+
+            if st.session_state.revised_contract:
+                st.markdown("#### 📝 修订版合同预览")
+                st.text_area(
+                    "修订版合同正文",
+                    value=st.session_state.revised_contract["contract_text"],
+                    height=420,
+                    disabled=True,
+                    label_visibility="collapsed",
+                )
+                revised_export_col1, revised_export_col2 = st.columns(2)
+                revised_filename = f"revised_contract_{int(time.time())}"
+                with revised_export_col1:
+                    st.download_button(
+                        "📥 导出修订合同 Markdown",
+                        data=st.session_state.revised_contract["contract_text"],
+                        file_name=f"{revised_filename}.md",
+                        mime="text/markdown",
+                        use_container_width=True,
+                    )
+                with revised_export_col2:
+                    try:
+                        revised_docx = report_to_docx(
+                            st.session_state.revised_contract["contract_text"]
+                        )
+                        st.download_button(
+                            "📄 导出修订合同 Word",
+                            data=revised_docx,
+                            file_name=f"{revised_filename}.docx",
+                            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                            use_container_width=True,
+                        )
+                    except RuntimeError as exc:
+                        st.error(str(exc))
 
     start_full_review = st.button("🚀 开始执行合同智能合规审查", type="primary", use_container_width=True, disabled=st.session_state.is_reviewing or not bool(st.session_state.full_contract_text))
 
@@ -538,63 +604,6 @@ with st.container():
         st.markdown('<div class="report-card">', unsafe_allow_html=True)
         st.markdown(clean_report_content(st.session_state.final_report))
         st.markdown('</div>', unsafe_allow_html=True)
-
-        selected_revision_indices = [
-            int(c.get("index"))
-            for c in st.session_state.clauses
-            if st.session_state.get(f"rewrite_clause_{c.get('index')}", False)
-        ]
-        if selected_revision_indices:
-            if st.button(
-                "📝 根据选中条款和审查意见生成修订合同",
-                type="secondary",
-                use_container_width=True,
-            ):
-                with st.spinner("正在按选中条款生成修订合同..."):
-                    try:
-                        st.session_state.revised_contract = rewrite_contract(
-                            API_BASE_URL,
-                            st.session_state.clauses,
-                            st.session_state.final_report,
-                            selected_revision_indices,
-                        )
-                        st.success("修订合同生成完成，未选中的条款保持原文。")
-                    except Exception as exc:
-                        st.error(f"生成修订合同失败: {exc}")
-
-        if st.session_state.revised_contract:
-            st.markdown("#### 📝 修订版合同预览")
-            st.text_area(
-                "修订版合同正文",
-                value=st.session_state.revised_contract["contract_text"],
-                height=420,
-                disabled=True,
-                label_visibility="collapsed",
-            )
-            revised_export_col1, revised_export_col2 = st.columns(2)
-            revised_filename = f"revised_contract_{int(time.time())}"
-            with revised_export_col1:
-                st.download_button(
-                    "📥 导出修订合同 Markdown",
-                    data=st.session_state.revised_contract["contract_text"],
-                    file_name=f"{revised_filename}.md",
-                    mime="text/markdown",
-                    use_container_width=True,
-                )
-            with revised_export_col2:
-                try:
-                    revised_docx = report_to_docx(
-                        st.session_state.revised_contract["contract_text"]
-                    )
-                    st.download_button(
-                        "📄 导出修订合同 Word",
-                        data=revised_docx,
-                        file_name=f"{revised_filename}.docx",
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                        use_container_width=True,
-                    )
-                except RuntimeError as exc:
-                    st.error(str(exc))
 
         st.markdown("<br>", unsafe_allow_html=True)
         export_col1, export_col2 = st.columns(2)
