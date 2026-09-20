@@ -133,6 +133,8 @@ if "circuit_breaks" not in st.session_state:
     st.session_state.circuit_breaks = []  # 存储各任务熔断详情
 if "revised_contract" not in st.session_state:
     st.session_state.revised_contract = None
+if "revised_contract_signature" not in st.session_state:
+    st.session_state.revised_contract_signature = None
 
 
 # ==================== 3. 辅助函数 ====================
@@ -234,6 +236,7 @@ with st.container():
             st.session_state.full_contract_text = "\n\n".join([f"{c['title']}\n{c['content']}" for c in sample_clauses])
             st.session_state.final_report = ""
             st.session_state.revised_contract = None
+            st.session_state.revised_contract_signature = None
             st.session_state.circuit_breaks = []
             st.rerun()
 
@@ -260,6 +263,7 @@ with st.container():
                     st.session_state.last_uploaded_name = uploaded_file.name
                     st.session_state.final_report = ""
                     st.session_state.revised_contract = None
+                    st.session_state.revised_contract_signature = None
                     st.session_state.circuit_breaks = []
                     st.success(f"解析成功，切分出 {len(data['clauses'])} 个条款单元！")
                     st.rerun()
@@ -312,11 +316,13 @@ with st.container():
             elif not selected_revision_indices:
                 st.warning("请选择至少一个“纳入合同修订”的条款。")
             else:
-                if st.button(
-                    "📝 根据审查意见生成修订合同",
-                    type="secondary",
-                    use_container_width=True,
-                    disabled=st.session_state.is_reviewing,
+                revision_signature = (
+                    tuple(selected_revision_indices),
+                    st.session_state.final_report,
+                )
+                if (
+                    st.session_state.revised_contract_signature
+                    != revision_signature
                 ):
                     with st.spinner("正在按选中条款生成修订合同..."):
                         try:
@@ -326,6 +332,7 @@ with st.container():
                                 st.session_state.final_report,
                                 selected_revision_indices,
                             )
+                            st.session_state.revised_contract_signature = revision_signature
                             st.success("修订合同生成完成，未选中的条款保持原文。")
                         except Exception as exc:
                             st.error(f"生成修订合同失败: {exc}")
