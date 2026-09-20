@@ -83,12 +83,14 @@ def _event(name: str, payload: Dict[str, Any]) -> Dict[str, str]:
 class ReviewOrchestrator:
     """Owns the SSE ReAct loop while leaving HTTP concerns in api_server."""
 
-    def __init__(self, agent: Any):
+    def __init__(self, agent: Any, debug: bool = False):
         self.agent = agent
+        self.debug = debug
 
     async def stream(
-        self, contract_text: str, max_turns: int, task_label: str, debug: bool = False
+        self, contract_text: str, max_turns: int, task_label: str
     ) -> AsyncGenerator[Dict[str, str], None]:
+        debug = self.debug
         max_search_budget = max(3, max_turns - 1)
         messages = [
             {"role": "system", "content": AGENT_SYSTEM_PROMPT},

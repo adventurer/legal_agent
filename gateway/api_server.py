@@ -15,6 +15,7 @@
 
 import os
 import sys
+import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -158,19 +159,23 @@ async def review_contract_stream(request: ReviewRequest):
     )
     task_label = clause_title_match.group(1).strip() if clause_title_match else f"Task-{uuid.uuid4().hex[:6]}"
     return EventSourceResponse(
-        review_orchestrator.stream(
-            request.contract_text,
-            limit_turns,
-            task_label,
-            debug=bool(request.debug),
-        )
+        review_orchestrator.stream(request.contract_text, limit_turns, task_label)
     )
 
 
 def main():
+    parser = argparse.ArgumentParser(description="启动 Legal Agent FastAPI Gateway")
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="在控制台打印每轮模型请求、响应和工具交互详情",
+    )
+    args = parser.parse_args()
+    review_orchestrator.debug = args.debug
     print(f"[*] 正在启动 Legal Agent FastAPI Gateway 监听: http://{GATEWAY_HOST}:{GATEWAY_PORT}")
+    print(f"[*] 模型交互 Debug: {'开启' if args.debug else '关闭'}")
     uvicorn.run(
-        "gateway.api_server:app",
+        app,
         host=GATEWAY_HOST,
         port=GATEWAY_PORT,
         reload=False,

@@ -205,11 +205,6 @@ with st.container():
 
     with ctrl_col3:
         max_turns = st.slider("每轮最大探索步数", min_value=3, max_value=8, value=5, step=1)
-        debug_mode = st.checkbox(
-            "开启模型交互 Debug",
-            value=False,
-            help="开启后，API 网关控制台会打印每轮模型请求、响应和工具结果。",
-        )
 
     with ctrl_col4:
         st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
@@ -276,11 +271,7 @@ st.markdown("<hr style='margin: 1.4rem 0; border: none; border-top: 1px solid #E
 
 
 # ==================== 6. 单通道 SSE 审查逻辑 ====================
-def execute_stream_review(
-    text_to_review: str,
-    target_name: str = "合同正文",
-    debug: bool = False,
-) -> Optional[str]:
+def execute_stream_review(text_to_review: str, target_name: str = "合同正文") -> Optional[str]:
     st.session_state.is_reviewing = True
     st.session_state.circuit_breaks = []
 
@@ -295,9 +286,7 @@ def execute_stream_review(
     extracted_final = ""
 
     try:
-        for sse in stream_contract_review(
-            API_BASE_URL, text_to_review, max_turns, debug=debug
-        ):
+        for sse in stream_contract_review(API_BASE_URL, text_to_review, max_turns):
             event = sse["event"]
             data = sse["data"]
 
@@ -356,9 +345,7 @@ def execute_stream_review(
 
 
 # ==================== 7. 多线程并发调度器 ====================
-def _worker_clause_review(
-    clause: Dict[str, Any], turns: int, debug: bool = False
-) -> Dict[str, Any]:
+def _worker_clause_review(clause: Dict[str, Any], turns: int) -> Dict[str, Any]:
     clause_text = f"{clause['title']}\n{clause['content']}"
     accumulated_tokens = ""
     extracted_final = ""
@@ -366,9 +353,7 @@ def _worker_clause_review(
     circuit_break_info = None
 
     try:
-        for sse in stream_contract_review(
-            API_BASE_URL, clause_text, turns, debug=debug
-        ):
+        for sse in stream_contract_review(API_BASE_URL, clause_text, turns):
             event = sse["event"]
             data = sse["data"]
             if event == "token":
@@ -404,7 +389,7 @@ def _worker_clause_review(
 
 
 def execute_concurrent_clause_review(
-    clauses_to_review: List[Dict[str, Any]], max_workers: int, debug: bool = False
+    clauses_to_review: List[Dict[str, Any]], max_workers: int
 ) -> str:
     st.session_state.is_reviewing = True
     st.session_state.circuit_breaks = []
@@ -425,10 +410,7 @@ def execute_concurrent_clause_review(
     completed_count = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(_worker_clause_review, c, max_turns, debug): c["index"]
-            for c in clauses_to_review
-        }
+        future_map = {executor.submit(_worker_clause_review, c, max_turns): c["index"] for c in clauses_to_review}
         for future in as_completed(future_map):
             c_idx = future_map[future]
             res = future.result()
@@ -469,9 +451,7 @@ with st.container():
         target_clause = next((c for c in st.session_state.clauses if c.get("index") == selected_clause_idx), None)
         if target_clause:
             target_text = f"{target_clause['title']}\n{target_clause['content']}"
-            report = execute_stream_review(
-                target_text, target_name=target_clause["title"], debug=debug_mode
-            )
+            report = execute_stream_review(target_text, target_name=target_clause["title"])
             if report:
                 st.session_state.final_report = f"## 针对【{target_clause['title']}】的专属审查意见\n\n" + report
                 st.rerun()
@@ -488,28 +468,18 @@ with st.container():
                     progress_bar = st.progress(0, text="单路条款逐条精审中...")
                     for idx, clause in enumerate(article_clauses):
                         progress_bar.progress((idx + 1) / total_articles, text=f"正在精审 ({idx+1}/{total_articles}): {clause['title']}")
-                        report_part = execute_stream_review(
-                            f"{clause['title']}\n{clause['content']}",
-                            target_name=clause["title"],
-                            debug=debug_mode,
-                        )
+                        report_part = execute_stream_review(f"{clause['title']}\n{clause['content']}", target_name=clause["title"])
                         if report_part:
                             aggregated_reports.append(f"### 条款 {clause['index']}: {clause['title']}\n\n{report_part}\n\n---")
                     progress_bar.empty()
                     st.session_state.final_report = "# 综合合同审查终审报告 (逐条精审汇总)\n\n" + "\n\n".join(aggregated_reports)
                     st.rerun()
                 else:
-                    final_aggregated = execute_concurrent_clause_review(
-                        article_clauses, max_workers=concurrency, debug=debug_mode
-                    )
+                    final_aggregated = execute_concurrent_clause_review(article_clauses, max_workers=concurrency)
                     st.session_state.final_report = final_aggregated
                     st.rerun()
             else:
-                report = execute_stream_review(
-                    st.session_state.full_contract_text,
-                    target_name="全篇合同全文",
-                    debug=debug_mode,
-                )
+                report = execute_stream_review(st.session_state.full_contract_text, target_name="全篇合同全文")
                 if report:
                     st.session_state.final_report = report
                     st.rerun()

@@ -37,10 +37,8 @@ pip install streamlit httpx-sse
 # Streamlit 支持下载 Markdown (.md) 和 Word (.docx) 两种格式
 
 # API 调试
-# 审查接口支持在控制台打印与大模型交互的详细内容：
-# POST /api/v1/contract/review/stream
-# JSON 中增加 "debug": true，可查看每轮 messages、请求参数、模型响应和工具结果。
-# Streamlit UI 顶部的“开启模型交互 Debug”选项也会传递该参数。
+# 启动 API 服务时增加 --debug，可在控制台打印每轮 messages、请求参数、模型响应和工具结果：
+python gateway/api_server.py --debug
 
 # 4. 创建项目专属目录并进入
 mkdir -p ~/legal_agent_lab && cd ~/legal_agent_lab
