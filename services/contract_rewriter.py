@@ -7,6 +7,15 @@ from typing import Any, Dict, List
 from core.prompts import CONTRACT_REWRITE_PROMPT
 
 
+def _normalize_clause_title(value: Any) -> str:
+    """Normalize Markdown formatting and spacing before comparing titles."""
+    text = str(value or "")
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text = re.sub(r"\[\]\([^)]+\)", "", text)
+    text = re.sub(r"[*_`#]", "", text)
+    return re.sub(r"\s+", "", text).strip().lower()
+
+
 def _extract_json(raw_text: str) -> Dict[str, Any]:
     content = (raw_text or "").strip()
     content = re.sub(r"^```(?:json)?\s*|\s*```$", "", content, flags=re.IGNORECASE)
@@ -27,24 +36,38 @@ def _review_for_clause(
     if not report:
         return ""
 
-    markers = [
-        f"条款 {clause_index}",
-        f"条款{clause_index}",
-        clause_title.strip(),
-    ]
-    start = next(
+    normalized_title = _normalize_clause_title(clause_title)
+    title_start = -1
+    for match in re.finditer(r"(?im)^\s*(?:#{1,6}\s*)?.+$", report):
+        candidate = match.group(0)
+        if normalized_title and (
+            normalized_title in _normalize_clause_title(candidate)
+            or _normalize_clause_title(candidate) in normalized_title
+        ):
+            title_start = match.start()
+            break
+    markers = [f"条款 {clause_index}", f"条款{clause_index}", clause_title.strip()]
+    start = title_start if title_start >= 0 else next(
         (report.find(marker) for marker in markers if marker and report.find(marker) >= 0),
         -1,
     )
     if start < 0:
         return report[:4000]
 
-    next_section = re.search(
-        r"\n\s*#{1,6}\s+条款\s*\d+",
-        report[start + 1 :],
-        flags=re.IGNORECASE,
-    )
-    end = start + 1 + next_section.start() if next_section else len(report)
+    end = len(report)
+    for heading in re.finditer(
+        r"(?im)^\s*#{1,6}\s+(.+)$", report[start + 1 :]
+    ):
+        if heading.start() == 0:
+            continue
+        heading_text = heading.group(1)
+        if re.search(
+            r"(?:条款\s*\d+|第[一二三四五六七八九十百千零0-9]+条)",
+            heading_text,
+            flags=re.IGNORECASE,
+        ):
+            end = start + 1 + heading.start()
+            break
     return report[start:end].strip()[:6000]
 
 
@@ -69,14 +92,26 @@ def _rewrite_clause(
         stream=False,
     )
     result = _extract_json(response.choices[0].message.content)
-    revised = next(
-        (
-            item
-            for item in result["revised_clauses"]
-            if int(item.get("index", -1)) == index and item.get("revised_text")
-        ),
-        None,
-    )
+    revised = None
+    normalized_title = _normalize_clause_title(title)
+    for item in result["revised_clauses"]:
+        if not item.get("revised_text"):
+            continue
+        try:
+            item_index = int(item.get("index", -1))
+        except (TypeError, ValueError):
+            item_index = -1
+        item_title = _normalize_clause_title(item.get("title", ""))
+        if item_index == index or (
+            item_title
+            and (
+                item_title == normalized_title
+                or item_title in normalized_title
+                or normalized_title in item_title
+            )
+        ):
+            revised = item
+            break
     if revised is None:
         raise ValueError(f"模型未返回条款 {index} 的有效修订结果")
     return revised
