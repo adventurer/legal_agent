@@ -19,6 +19,69 @@ def _extract_json(raw_text: str) -> Dict[str, Any]:
     return value
 
 
+def _review_for_clause(
+    review_report: str, clause_index: int, clause_title: str
+) -> str:
+    """Keep each rewrite request focused on the matching review section."""
+    report = (review_report or "").strip()
+    if not report:
+        return ""
+
+    markers = [
+        f"条款 {clause_index}",
+        f"条款{clause_index}",
+        clause_title.strip(),
+    ]
+    start = next(
+        (report.find(marker) for marker in markers if marker and report.find(marker) >= 0),
+        -1,
+    )
+    if start < 0:
+        return report[:4000]
+
+    next_section = re.search(
+        r"\n\s*#{1,6}\s+条款\s*\d+",
+        report[start + 1 :],
+        flags=re.IGNORECASE,
+    )
+    end = start + 1 + next_section.start() if next_section else len(report)
+    return report[start:end].strip()[:6000]
+
+
+def _rewrite_clause(
+    agent: Any,
+    clause: Dict[str, Any],
+    review_report: str,
+) -> Dict[str, Any]:
+    """Rewrite one clause in an isolated model request."""
+    index = int(clause.get("index", 0))
+    title = str(clause.get("title", f"条款 {index}"))
+    clause_review = _review_for_clause(review_report, index, title)
+    prompt = CONTRACT_REWRITE_PROMPT.format(
+        clauses=json.dumps([clause], ensure_ascii=False),
+        review_report=clause_review,
+    )
+    response = agent.client.chat.completions.create(
+        model=agent.model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.0,
+        max_tokens=2048,
+        stream=False,
+    )
+    result = _extract_json(response.choices[0].message.content)
+    revised = next(
+        (
+            item
+            for item in result["revised_clauses"]
+            if int(item.get("index", -1)) == index and item.get("revised_text")
+        ),
+        None,
+    )
+    if revised is None:
+        raise ValueError(f"模型未返回条款 {index} 的有效修订结果")
+    return revised
+
+
 def rewrite_selected_clauses(
     agent: Any,
     clauses: List[Dict[str, Any]],
@@ -33,23 +96,9 @@ def rewrite_selected_clauses(
     if not selected_clauses:
         raise ValueError("至少选择一个需要修订的条款")
 
-    prompt = CONTRACT_REWRITE_PROMPT.format(
-        clauses=json.dumps(selected_clauses, ensure_ascii=False),
-        review_report=review_report,
-    )
-    response = agent.client.chat.completions.create(
-        model=agent.model_name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-        max_tokens=4096,
-        stream=False,
-    )
-    raw_content = response.choices[0].message.content
-    result = _extract_json(raw_content)
     revised_by_index = {
-        int(item["index"]): item
-        for item in result["revised_clauses"]
-        if "index" in item and item.get("revised_text")
+        int(clause["index"]): _rewrite_clause(agent, clause, review_report)
+        for clause in selected_clauses
     }
 
     contract_parts = []
