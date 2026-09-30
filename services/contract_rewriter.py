@@ -102,13 +102,12 @@ def _rewrite_clause(
         except (TypeError, ValueError):
             item_index = -1
         item_title = _normalize_clause_title(item.get("title", ""))
-        if item_index == index or (
-            item_title
-            and (
-                item_title == normalized_title
-                or item_title in normalized_title
-                or normalized_title in item_title
-            )
+        # An explicit index is authoritative. A title match is only a fallback
+        # for responses that omit the index; never let a title override it.
+        if (item_index == index) or (
+            item_index < 0
+            and item_title
+            and item_title == normalized_title
         ):
             revised = item
             break
@@ -142,8 +141,14 @@ def rewrite_selected_clauses(
         index = int(clause.get("index", 0))
         title = str(clause.get("title", f"条款 {index}"))
         revised = revised_by_index.get(index)
-        text = str(revised["revised_text"]) if revised else str(clause.get("content", ""))
-        contract_parts.append(f"{title}\n{text}".strip())
+        if revised:
+            text = str(revised["revised_text"])
+            contract_parts.append(f"{title}\n{text}".strip())
+        else:
+            text = str(clause.get("content", ""))
+            # Keep the exact extracted clause text where available (not an
+            # invented title/content reconstruction for preambles or sign pages).
+            contract_parts.append(str(clause.get("raw_text") or f"{title}\n{text}").strip())
         if revised:
             revised_clauses.append({
                 "index": index,

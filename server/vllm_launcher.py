@@ -18,50 +18,20 @@ from pathlib import Path
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
-from configs.config import DEFAULT_MODEL_KEY
+from configs.config import DEFAULT_MODEL_KEY, MODELS_DIR, MODEL_PRESETS
 
 # 获取项目根目录 (假设当前脚本位于 legal_agent_lab/server/)
-# 统一且唯一的模型存放基目录：legal_agent_lab/models/
-MODELS_BASE_DIR = ROOT_DIR / "models"
+# 与 Agent/API 配置共用同一模型目录（包含 MODELS_DIR 环境变量覆盖）。
+MODELS_BASE_DIR = MODELS_DIR
 
 # ==================== 支持的模型配置注册表 ====================
+# 启动器和 API 配置共享同一个 registry，切换默认模型时不会留下旧路径或上下文长度。
 SUPPORTED_MODELS = {
-    # 3B 原生指令版（超轻量，极低显存设备兜底）
-    "qwen2.5-3b": {
-        "modelscope_id": "Qwen/Qwen2.5-3B-Instruct-AWQ",
-        "model_dir": MODELS_BASE_DIR / "Qwen2.5-3B-Instruct-AWQ",
-        "quantization": "awq",
-        "max_model_len": 4096,
-        "gpu_utilization": 0.80,
-        "served_name": "qwen2.5-3b",
-    },
-    # 7B AWQ 量化版（8GB 显存主力推荐）
-    "qwen2.5-7b-awq": {
-        "modelscope_id": "Qwen/Qwen2.5-7B-Instruct-AWQ",
-        "model_dir": MODELS_BASE_DIR / "Qwen2.5-7B-Instruct-AWQ",
-        "quantization": "awq",
-        "max_model_len": 8192,
-        "gpu_utilization": 0.85,
-        "served_name": "qwen2.5-7b",
-    },
-    # 14B AWQ 量化版（适合 12G/16G 显存）
-    "qwen2.5-14b-awq": {
-        "modelscope_id": "Qwen/Qwen2.5-14B-Instruct-AWQ",
-        "model_dir": MODELS_BASE_DIR / "Qwen2.5-14B-Instruct-AWQ",
-        "quantization": "awq",
-        "max_model_len": 4096,
-        "gpu_utilization": 0.88,
-        "served_name": "qwen2.5-14b",
-    },
-    # DeepSeek 蒸馏 7B AWQ
-    "deepseek-r1-7b-awq": {
-        "modelscope_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
-        "model_dir": MODELS_BASE_DIR / "DeepSeek-R1-Distill-Qwen-7B-AWQ",
-        "quantization": "awq",
-        "max_model_len": 4096,
-        "gpu_utilization": 0.85,
-        "served_name": "deepseek-r1-7b",
-    },
+    model_key: {
+        **preset,
+        "model_dir": MODELS_BASE_DIR / preset["model_dir_name"],
+    }
+    for model_key, preset in MODEL_PRESETS.items()
 }
 
 

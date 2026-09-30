@@ -36,10 +36,54 @@ for directory in [REFERENCE_DOCS_DIR, DATA_DIR, MODELS_DIR]:
 
 
 # ==================== 2. 模型与推理服务 (vLLM) 配置 ====================
-# 默认部署的模型名称与物理子目录
-DEFAULT_MODEL_NAME = "qwen2.5-7b"
-DEFAULT_MODEL_KEY = "qwen2.5-7b-awq"
-DEFAULT_MODEL_DIR_NAME = "Qwen2.5-7B-Instruct-AWQ"
+# 模型注册表是模型名称、启动别名、权重目录和上下文配置的唯一来源。
+MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
+    "qwen2.5-3b": {
+        "served_name": "qwen2.5-3b", "model_dir_name": "Qwen2.5-3B-Instruct-AWQ",
+        "modelscope_id": "Qwen/Qwen2.5-3B-Instruct-AWQ", "max_model_len": 4096,
+        "gpu_utilization": 0.80, "quantization": "awq",
+    },
+    "qwen2.5-7b-awq": {
+        "served_name": "qwen2.5-7b", "model_dir_name": "Qwen2.5-7B-Instruct-AWQ",
+        "modelscope_id": "Qwen/Qwen2.5-7B-Instruct-AWQ", "max_model_len": 8192,
+        "gpu_utilization": 0.85, "quantization": "awq",
+    },
+    "qwen2.5-14b-awq": {
+        "served_name": "qwen2.5-14b", "model_dir_name": "Qwen2.5-14B-Instruct-AWQ",
+        "modelscope_id": "Qwen/Qwen2.5-14B-Instruct-AWQ", "max_model_len": 4096,
+        "gpu_utilization": 0.88, "quantization": "awq",
+    },
+    "deepseek-r1-7b-awq": {
+        "served_name": "deepseek-r1-7b", "model_dir_name": "DeepSeek-R1-Distill-Qwen-7B-AWQ",
+        "modelscope_id": "deepseek-ai/DeepSeek-R1-Distill-Qwen-7B", "max_model_len": 4096,
+        "gpu_utilization": 0.85, "quantization": "awq",
+    },
+}
+
+_MODEL_NAME_TO_KEY = {preset["served_name"]: key for key, preset in MODEL_PRESETS.items()}
+_requested_model_name = os.getenv("DEFAULT_MODEL_NAME")
+_configured_model_key = os.getenv("DEFAULT_MODEL_KEY")
+if _configured_model_key:
+    if _configured_model_key not in MODEL_PRESETS:
+        raise ValueError(f"不支持的 DEFAULT_MODEL_KEY: {_configured_model_key}")
+    if _requested_model_name and _requested_model_name not in _MODEL_NAME_TO_KEY:
+        raise ValueError(f"不支持的 DEFAULT_MODEL_NAME: {_requested_model_name}")
+    if (
+        _requested_model_name in _MODEL_NAME_TO_KEY
+        and _MODEL_NAME_TO_KEY[_requested_model_name] != _configured_model_key
+    ):
+        raise ValueError("DEFAULT_MODEL_NAME 与 DEFAULT_MODEL_KEY 指向不同模型，请统一配置")
+    DEFAULT_MODEL_KEY = _configured_model_key
+else:
+    _requested_model_name = _requested_model_name or "qwen2.5-7b"
+    try:
+        DEFAULT_MODEL_KEY = _MODEL_NAME_TO_KEY[_requested_model_name]
+    except KeyError as exc:
+        raise ValueError(f"不支持的 DEFAULT_MODEL_NAME: {_requested_model_name}") from exc
+
+_DEFAULT_MODEL_PRESET = MODEL_PRESETS[DEFAULT_MODEL_KEY]
+DEFAULT_MODEL_NAME = _DEFAULT_MODEL_PRESET["served_name"]
+DEFAULT_MODEL_DIR_NAME = _DEFAULT_MODEL_PRESET["model_dir_name"]
 DEFAULT_MODEL_PATH = MODELS_DIR / DEFAULT_MODEL_DIR_NAME
 
 # vLLM 服务端监听配置
@@ -54,9 +98,9 @@ VLLM_API_KEY = os.getenv("VLLM_API_KEY", "none")
 VLLM_CONFIG: Dict[str, Any] = {
     "model_path": str(DEFAULT_MODEL_PATH),
     "served_name": DEFAULT_MODEL_NAME,
-    "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", "4096")),
-    "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEM_UTIL", "0.85")),
-    "quantization": "awq",
+    "max_model_len": int(os.getenv("VLLM_MAX_MODEL_LEN", str(_DEFAULT_MODEL_PRESET["max_model_len"]))),
+    "gpu_memory_utilization": float(os.getenv("VLLM_GPU_MEM_UTIL", str(_DEFAULT_MODEL_PRESET["gpu_utilization"]))),
+    "quantization": _DEFAULT_MODEL_PRESET["quantization"],
     "kv_cache_dtype": "auto",  # 保持原生 FP16，严禁在此开启 FP8
     "model_key": DEFAULT_MODEL_KEY,
 }

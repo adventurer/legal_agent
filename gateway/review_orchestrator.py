@@ -4,6 +4,7 @@ import asyncio
 import json
 import re
 from typing import Any, AsyncGenerator, Dict, List
+from starlette.concurrency import iterate_in_threadpool
 
 from configs.config import AGENT_CONFIG
 from configs.kb_recommendations import (
@@ -16,12 +17,17 @@ from core.action_parser import extract_action, extract_actions
 from core.prompts import (
     AGENT_SYSTEM_PROMPT,
     EMPTY_SEARCH_RETRY_PROMPT,
+    FINAL_CONSISTENCY_CHECK_PROMPT,
     FORCE_FINAL_CONVERGENCE_PROMPT,
     TOOL_CALL_RETRY_PROMPT,
     USER_CONTRACT_INPUT_TEMPLATE,
     format_observation,
 )
-from services.report_parser import clean_report_content, is_final_report
+from services.report_parser import (
+    clean_report_content,
+    is_final_report,
+    parse_structured_report,
+)
 
 MODEL_MAX_CONTEXT = AGENT_CONFIG.get("max_context_tokens", 8192)
 CONTEXT_THRESHOLD_95 = int(MODEL_MAX_CONTEXT * 0.95)
@@ -48,6 +54,51 @@ def estimate_prompt_tokens(messages: List[Dict[str, Any]]) -> int:
 def context_budget_exceeded(input_tokens: int, output_budget: int) -> bool:
     """Check whether the requested input plus output budget reaches the safe limit."""
     return input_tokens + output_budget >= int(MODEL_MAX_CONTEXT * CONTEXT_SAFETY_RATIO)
+
+
+def _final_review_messages(contract_text: str, observations: List[str]) -> List[Dict[str, str]]:
+    """Build a compact final-review context from the contract and actual tool evidence."""
+    evidence_by_id: Dict[str, Dict[str, Any]] = {}
+    for observation in observations:
+        try:
+            payload = json.loads(observation)
+        except (TypeError, ValueError):
+            continue
+        for item in payload.get("evidence", []) if isinstance(payload, dict) else []:
+            if item.get("id"):
+                evidence_by_id[item["id"]] = item
+
+    evidence_lines = []
+    remaining_chars = 2600
+    for evidence in evidence_by_id.values():
+        record = {
+            "id": evidence.get("id"),
+            "document": evidence.get("doc_name"),
+            "article_no": evidence.get("article_no"),
+            "title": evidence.get("title"),
+            "text": str(evidence.get("text", ""))[:500],
+        }
+        line = json.dumps(record, ensure_ascii=False)
+        if len(line) > remaining_chars:
+            break
+        evidence_lines.append(line)
+        remaining_chars -= len(line) + 1
+
+    evidence_text = "\n".join(evidence_lines) if evidence_lines else "本轮没有取得可引用的法规原文证据。"
+    system = (
+        "你是合同审查员。只依据合同原文和下面列出的实际检索证据完成 Markdown 报告，"
+        "逐项审查提供的条款，不得调用工具、补造法条或用记忆填补缺失依据。"
+        "每个直接法律结论必须有内容相关的证据支持，并引用对应 [[EVIDENCE:编号]]；"
+        "若证据不支持具体法律结论，写‘未检索到直接依据’，可说明商业风险。"
+        "准确保留合同中已写明的期限、金额、责任和条件；不要把已有内容说成未约定。"
+        "按条款逐项输出风险等级、法律/合规依据、风险分析和修改建议。"
+    )
+    user = (
+        "合同原文：\n" + contract_text +
+        "\n\n实际检索到的证据（只允许引用这里列出的编号）：\n" + evidence_text +
+        "\n\n检索已经结束，请直接给出完整最终审查报告。"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
 def generate_kb_deficit_recommendation(
@@ -87,6 +138,104 @@ class ReviewOrchestrator:
         self.agent = agent
         self.debug = debug
 
+    @staticmethod
+    def _validation_evidence(observations: List[str], draft_report: str) -> List[Dict[str, Any]]:
+        evidence_by_id: Dict[str, Dict[str, Any]] = {}
+        for observation in observations:
+            try:
+                payload = json.loads(observation)
+            except (TypeError, ValueError):
+                continue
+            for item in payload.get("evidence", []) if isinstance(payload, dict) else []:
+                evidence_id = item.get("id")
+                if evidence_id:
+                    evidence_by_id[evidence_id] = item
+
+        cited_ids = set(re.findall(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", draft_report))
+        article_numbers = set(re.findall(
+            r"第\s*[零〇一二三四五六七八九十百千万两0-9]+\s*条", draft_report
+        ))
+        selected = [item for key, item in evidence_by_id.items() if key in cited_ids]
+        if not selected and article_numbers:
+            selected = [
+                item for item in evidence_by_id.values()
+                if re.sub(r"\s+", "", str(item.get("article_no", "")))
+                in {re.sub(r"\s+", "", number) for number in article_numbers}
+            ]
+        if not selected:
+            selected = list(evidence_by_id.values())[:4]
+
+        formatted = []
+        remaining_chars = 7000
+        for item in selected[:6]:
+            text = str(item.get("text", ""))
+            if remaining_chars <= 0:
+                break
+            text = text[:remaining_chars]
+            formatted.append({
+                "id": item.get("id"),
+                "document": item.get("doc_name"),
+                "article_no": item.get("article_no"),
+                "title": item.get("title"),
+                "page": item.get("page_start"),
+                "text": text,
+            })
+            remaining_chars -= len(text)
+        return formatted
+
+    async def _check_final_report(
+        self,
+        contract_text: str,
+        draft_report: str,
+        observations: List[str],
+    ) -> tuple[str, bool, str]:
+        evidence = self._validation_evidence(observations, draft_report)
+        check_messages = [
+            {"role": "system", "content": FINAL_CONSISTENCY_CHECK_PROMPT},
+            {"role": "user", "content": json.dumps({
+                "contract_text": contract_text,
+                "retrieved_evidence": evidence,
+                "draft_report": draft_report,
+            }, ensure_ascii=False)},
+        ]
+        input_tokens = estimate_prompt_tokens(check_messages)
+        while evidence and input_tokens > MODEL_MAX_CONTEXT - 640:
+            evidence.pop()
+            check_messages[1]["content"] = json.dumps({
+                "contract_text": contract_text,
+                "retrieved_evidence": evidence,
+                "draft_report": draft_report,
+            }, ensure_ascii=False)
+            input_tokens = estimate_prompt_tokens(check_messages)
+        if input_tokens > MODEL_MAX_CONTEXT - 320:
+            return draft_report, False, "合同或报告超出复核上下文预算，保留初稿"
+        max_tokens = min(OUTPUT_MAX_TOKENS, MODEL_MAX_CONTEXT - input_tokens - 64)
+        try:
+            response = await asyncio.to_thread(
+                self.agent.client.chat.completions.create,
+                model=self.agent.model_name,
+                messages=check_messages,
+                temperature=0,
+                top_p=1,
+                seed=AGENT_CONFIG.get("seed", 42),
+                max_tokens=max_tokens,
+                stop=None,
+                stream=False,
+            )
+            if not response.choices:
+                return draft_report, False, "复核模型未返回内容，保留初稿"
+            choice = response.choices[0]
+            content = getattr(getattr(choice, "message", None), "content", None)
+            if not content or getattr(choice, "finish_reason", None) == "length":
+                return draft_report, False, "复核结果为空或被截断，保留初稿"
+            checked_report = clean_report_content(str(content))
+            if len(checked_report) < max(40, len(draft_report) // 4):
+                return draft_report, False, "复核结果异常短，保留初稿"
+            return checked_report, True, "复核完成"
+        except Exception as exc:
+            print(f"[警告][复核] 最终一致性检查失败: {exc}", flush=True)
+            return draft_report, False, f"复核调用失败，保留初稿：{exc}"
+
     async def stream(
         self, contract_text: str, max_turns: int, task_label: str
     ) -> AsyncGenerator[Dict[str, str], None]:
@@ -97,7 +246,9 @@ class ReviewOrchestrator:
             {"role": "user", "content": USER_CONTRACT_INPUT_TEMPLATE.format(contract_text=contract_text)},
         ]
         executed_tool_calls = set()
+        tool_observations_by_action: Dict[str, str] = {}
         history_queries: List[str] = []
+        tool_observations: List[str] = []
         consecutive_repeat_count = 0
         consecutive_empty_searches = 0
         last_observation_empty = False
@@ -124,6 +275,9 @@ class ReviewOrchestrator:
                     "【系统强制干预】：当前检索已被限制，严禁继续发起工具查询！请直接以 Final: 开头输出最终审查报告。"
                 )})
 
+            if force_converge_mode:
+                messages = _final_review_messages(contract_text, tool_observations)
+
             is_last_turn = (turn == max_turns - 1) or force_converge_mode
             yield _event("turn_start", {
                 "task_id": task_label, "turn": turn + 1, "max_turns": max_turns,
@@ -147,6 +301,11 @@ class ReviewOrchestrator:
             reply_chunks = []
             repeated_action_detected = False
             current_max_tokens = OUTPUT_MAX_TOKENS if is_last_turn else REASONING_MAX_TOKENS
+            if force_converge_mode:
+                current_max_tokens = max(
+                    256,
+                    min(OUTPUT_MAX_TOKENS, MODEL_MAX_CONTEXT - input_tokens - 64),
+                )
             if (
                 context_budget_exceeded(input_tokens, current_max_tokens)
                 and not force_converge_mode
@@ -173,6 +332,13 @@ class ReviewOrchestrator:
                     ),
                     "attempted_queries": history_queries,
                 })
+                messages = _final_review_messages(contract_text, tool_observations)
+                input_chars = sum(len(str(message.get("content", ""))) for message in messages)
+                input_tokens = estimate_prompt_tokens(messages)
+                current_max_tokens = max(
+                    256,
+                    min(OUTPUT_MAX_TOKENS, MODEL_MAX_CONTEXT - input_tokens - 64),
+                )
             if debug:
                 print(
                     f"\n[DEBUG][{task_label}][轮次 {turn + 1}] "
@@ -188,8 +354,10 @@ class ReviewOrchestrator:
                     f"max_tokens={current_max_tokens}, stream=True",
                     flush=True,
                 )
+            stream_response = None
             try:
-                stream_response = self.agent.client.chat.completions.create(
+                stream_response = await asyncio.to_thread(
+                    self.agent.client.chat.completions.create,
                     model=self.agent.model_name, messages=messages,
                     temperature=AGENT_CONFIG.get("temperature", 0.0),
                     top_p=AGENT_CONFIG.get("top_p", 1.0), seed=AGENT_CONFIG.get("seed", 42),
@@ -198,7 +366,7 @@ class ReviewOrchestrator:
                     stream=True,
                     stream_options={"include_usage": True},
                 )
-                for chunk in stream_response:
+                async for chunk in iterate_in_threadpool(stream_response):
                     usage = getattr(chunk, "usage", None)
                     if usage is not None:
                         usage_prompt_tokens = getattr(usage, "prompt_tokens", None)
@@ -217,18 +385,19 @@ class ReviewOrchestrator:
                         partial_reply = "".join(reply_chunks)
                         actions = extract_actions(partial_reply)
                         if len(actions) >= 2:
-                            action_signatures = [
-                                f"{name}:{argument.strip()}" for name, argument in actions
-                            ]
-                            repeated_action_detected = (
-                                len(set(action_signatures)) < len(action_signatures)
-                                or len(actions) >= 3
-                            )
+                            repeated_action_detected = len(actions) >= 2
                             if repeated_action_detected:
                                 break
             except Exception as exc:
                 yield _event("error", {"error": f"底层推理交互异常: {str(exc)}", "task_id": task_label})
                 return
+            finally:
+                close_stream = getattr(stream_response, "close", None)
+                if close_stream:
+                    try:
+                        await asyncio.to_thread(close_stream)
+                    except Exception:
+                        pass
 
             reply = "".join(reply_chunks).strip()
             if debug:
@@ -283,26 +452,33 @@ class ReviewOrchestrator:
 
             actions = extract_actions(reply)
             if repeated_action_detected:
-                force_converge_mode = True
-                print(
-                    f"[⚠️ 单轮工具调用熔断][{task_label}] "
-                    f"检测到 {len(actions)} 个 Action，已提前停止本轮生成",
-                    flush=True,
-                )
-                yield _event("circuit_break", {
-                    "task_id": task_label,
-                    "reason_type": "单次模型响应连续生成多个工具调用",
-                    "detail": f"本轮检测到 {len(actions)} 个 Action，已提前中断生成",
-                    "recommendations": generate_kb_deficit_recommendation(history_queries, contract_text),
-                    "attempted_queries": history_queries,
-                })
-                messages.extend([
-                    {"role": "assistant", "content": reply},
-                    {"role": "user", "content": "【系统介入】：检测到单次响应包含多个工具调用，已停止工具检索。请直接以 Final: 开头输出最终审查报告。"},
-                ])
-                continue
+                first_tool = actions[0] if actions else (None, None)
+                if first_tool[0] in self.agent.tool_mapping and first_tool[1].strip():
+                    # Preserve the first legal search and discard extra calls from this turn.
+                    thought = next(
+                        (line.strip() for line in reply.splitlines() if line.strip().startswith("Thought:")),
+                        "Thought: 继续核对合同依据",
+                    )
+                    reply = f"{thought}\nAction: {first_tool[0]}({first_tool[1]})"
+                    actions = [first_tool]
+                    repeated_action_detected = False
+                    yield _event("action_recovered", {
+                        "task_id": task_label,
+                        "message": f"本轮包含多个工具动作，仅执行首个检索：{first_tool[0]}({first_tool[1]})",
+                    })
+                else:
+                    force_converge_mode = True
+                    messages = _final_review_messages(contract_text, tool_observations)
+                    yield _event("circuit_break", {
+                        "task_id": task_label,
+                        "reason_type": "单次模型响应包含多个无效工具动作",
+                        "detail": f"检测到 {len(actions)} 个 Action，首个动作无法识别，转入依据约束下的最终总结",
+                        "recommendations": generate_kb_deficit_recommendation(history_queries, contract_text),
+                        "attempted_queries": history_queries,
+                    })
+                    continue
 
-            tool_name, tool_arg = actions[0] if actions else (None, None)
+            tool_name, tool_arg = extract_action(reply)
             if tool_name and is_truncated and not is_last_turn:
                 force_converge_mode = True
                 print(
@@ -358,21 +534,54 @@ class ReviewOrchestrator:
                 return
 
             if tool_name and tool_name in self.agent.tool_mapping and not is_truncated:
-                action_sig = f"{tool_name}:{str(tool_arg).strip() if tool_arg else ''}"
-                history_queries.append(str(tool_arg).strip())
-                if action_sig in executed_tool_calls:
+                normalized_query = re.sub(
+                    r"[\s，,；;。.!！？?、]+", "", str(tool_arg or "")
+                ).casefold()
+                action_sig = f"{tool_name.casefold()}:{normalized_query}"
+                is_repeat = action_sig in executed_tool_calls
+                is_budget_exceeded = (
+                    not is_repeat and len(executed_tool_calls) >= max_search_budget
+                )
+                if is_repeat:
                     consecutive_repeat_count += 1
                 else:
                     consecutive_repeat_count = 0
                     executed_tool_calls.add(action_sig)
-                is_repeat = consecutive_repeat_count >= 1
-                is_budget_exceeded = len(executed_tool_calls) >= max_search_budget
+                    history_queries.append(str(tool_arg).strip())
                 is_empty_loop = consecutive_empty_searches >= 2
+
+                # Reuse the prior result on the first repeated request instead of
+                # running the same search again. This gives the model one chance
+                # to refine its query or finish with the evidence already returned.
+                if is_repeat and consecutive_repeat_count == 1:
+                    cached_observation = tool_observations_by_action.get(action_sig)
+                    if cached_observation is not None:
+                        yield _event("duplicate_action_reused", {
+                            "task_id": task_label,
+                            "tool": tool_name,
+                            "query": tool_arg,
+                            "message": "相同检索已执行过，复用已有结果并要求模型改用不同关键词或直接完成报告",
+                        })
+                        messages.extend([
+                            {"role": "assistant", "content": reply},
+                            {
+                                "role": "user",
+                                "content": (
+                                    f"{format_observation(cached_observation)}\n\n"
+                                    "【系统提示】：该检索关键词已经执行过，以上是原检索结果。"
+                                    "不得再次使用相同或仅空格/标点不同的关键词；请改用具体且不同的关键词，"
+                                    "或者在依据不足时直接输出 Final 并明确披露依据不足。"
+                                ),
+                            },
+                        ])
+                        continue
+
+                is_repeat = is_repeat and consecutive_repeat_count >= 2
                 if is_repeat or is_budget_exceeded or is_empty_loop:
                     if is_empty_loop or (is_repeat and last_observation_empty):
                         reason_type, detail = "知识库检索空召回（命中知识库盲区）", f"连续 {consecutive_empty_searches} 次未在知识库中匹配到法条"
                     elif is_repeat:
-                        reason_type, detail = "重复调用同一指令（死循环死锁）", f"连续多次执行相同动作 `{action_sig}`"
+                        reason_type, detail = "重复调用同一指令（死循环死锁）", f"已复用原检索结果后，模型仍重复请求 `{tool_name}({tool_arg})`（重复 {consecutive_repeat_count} 次）"
                     else:
                         reason_type, detail = "检索轮次预算耗尽", f"已执行检索次数达到安全预算 ({len(executed_tool_calls)}/{max_search_budget})"
                     print(f"\n[⚠️ 动态熔断拦截生效][{task_label}] 原因: {reason_type}")
@@ -389,10 +598,16 @@ class ReviewOrchestrator:
                     continue
 
                 yield _event("tool_start", {"task_id": task_label, "tool": tool_name, "query": tool_arg})
+                tool_failed = False
                 try:
-                    observation = self.agent.tool_mapping[tool_name](tool_arg)
+                    observation = await asyncio.to_thread(
+                        self.agent.tool_mapping[tool_name], tool_arg
+                    )
                 except Exception as exc:
                     observation = f"工具执行异常: {str(exc)}"
+                    tool_failed = True
+                tool_observations_by_action[action_sig] = observation
+                tool_observations.append(observation)
                 if debug:
                     print(
                         f"\n[DEBUG][{task_label}][轮次 {turn + 1}] 工具调用: "
@@ -413,7 +628,22 @@ class ReviewOrchestrator:
                     {"role": "assistant", "content": reply},
                     {"role": "user", "content": format_observation(observation)},
                 ])
-                if last_observation_empty:
+                if tool_failed:
+                    force_converge_mode = True
+                    yield _event("circuit_break", {
+                        "task_id": task_label,
+                        "reason_type": "工具执行失败",
+                        "detail": observation,
+                        "recommendations": generate_kb_deficit_recommendation(
+                            history_queries, contract_text
+                        ),
+                        "attempted_queries": history_queries,
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": "工具执行失败，未取得检索依据。请勿将失败信息当作法律依据；停止工具调用并直接说明依据缺失后给出审查结论。",
+                    })
+                elif last_observation_empty:
                     messages.append({
                         "role": "user",
                         "content": EMPTY_SEARCH_RETRY_PROMPT,
@@ -421,12 +651,49 @@ class ReviewOrchestrator:
                 continue
 
             if is_final_report(reply) or is_last_turn or is_truncated:
+                final_text = clean_report_content(reply)
+                validation_ok = False
+                validation_message = "截断输出未执行最终一致性检查" if is_truncated else ""
+                if not is_truncated:
+                    yield _event("validation_start", {
+                        "task_id": task_label,
+                        "message": "正在逐项核对合同子条款、原文事实与检索依据",
+                    })
+                    checked_text, validation_ok, validation_message = await self._check_final_report(
+                        contract_text, final_text, tool_observations
+                    )
+                    if validation_ok:
+                        changed = checked_text.strip() != final_text.strip()
+                        final_text = checked_text
+                        yield _event("validation_complete", {
+                            "task_id": task_label,
+                            "changed": changed,
+                            "message": "最终一致性检查已完成" + ("并修正了报告" if changed else "，未发现需修正内容"),
+                        })
+                    else:
+                        yield _event("validation_failed", {
+                            "task_id": task_label,
+                            "message": validation_message,
+                        })
+                structured_report = parse_structured_report(final_text)
                 yield _event("final_report", {
-                    "task_id": task_label, "raw_report": clean_report_content(reply),
+                    "task_id": task_label, "raw_report": final_text,
+                    "structured_report": (
+                        structured_report.model_dump(mode="json")
+                        if structured_report else None
+                    ),
                     "turns": turn + 1, "is_complete": not is_truncated,
                     "finish_reason": final_finish_reason,
-                    "status": "truncated" if is_truncated else "success",
+                    "status": (
+                        "truncated" if is_truncated else
+                        "limited_evidence" if force_converge_mode else "success"
+                    ),
                     "self_knowledge_mode": force_converge_mode,
+                    "consistency_checked": validation_ok,
+                    "consistency_message": (
+                        "文本一致性复核已执行；检索曾提前终止，法律依据完整性仍需核验"
+                        if force_converge_mode and validation_ok else validation_message
+                    ),
                 })
                 yield _event("done", {"task_id": task_label, "message": "审查流程结束"})
                 return

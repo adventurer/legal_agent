@@ -33,7 +33,12 @@ class ReviewSession:
 class SessionManager:
     """会话生命周期与滑动窗口治理管理器"""
 
-    def __init__(self, max_history_turns: int = 5, session_timeout_seconds: int = 3600):
+    def __init__(
+        self,
+        max_history_turns: int = 5,
+        session_timeout_seconds: int = 3600,
+        max_history_chars: int = 6000,
+    ):
         """
         :param max_history_turns: 滑动窗口保留的最大交互轮次（每轮包含 assistant 与 user）
         :param session_timeout_seconds: 会话过期淘汰时长（默认 1 小时）
@@ -41,6 +46,7 @@ class SessionManager:
         self._sessions: Dict[str, ReviewSession] = {}
         self.max_history_turns = max_history_turns
         self.session_timeout = session_timeout_seconds
+        self.max_history_chars = max(1, int(max_history_chars))
 
     def create_session(self, metadata: Optional[Dict[str, Any]] = None) -> str:
         """创建一个全新的会话"""
@@ -92,13 +98,23 @@ class SessionManager:
 
     def _apply_sliding_window(self, session: ReviewSession):
         """
-        滑动窗口治理：当历史消息超过 2 * max_history_turns 条时截断最早的轮次，
-        始终保证系统不超出本地 Qwen2.5 4096 Token 的承载限制
+        同时限制历史消息条数和字符总量。字符预算只是 Token 上限的保守近似，
+        不能替代模型 tokenizer 的精确计数。
         """
         max_messages = self.max_history_turns * 2
         if len(session.history_messages) > max_messages:
             # 丢弃最早的多余轮次
             session.history_messages = session.history_messages[-max_messages:]
+        while (
+            len(session.history_messages) > 1
+            and sum(len(message.get("content", "")) for message in session.history_messages)
+            > self.max_history_chars
+        ):
+            session.history_messages.pop(0)
+        if session.history_messages:
+            latest = session.history_messages[-1]
+            if len(latest.get("content", "")) > self.max_history_chars:
+                latest["content"] = latest["content"][-self.max_history_chars:]
 
     def delete_session(self, session_id: str):
         """显式销毁会话"""

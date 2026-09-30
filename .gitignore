@@ -2,3 +2,7 @@ models/*
 data/*
 .vscode/*
 *.pyc
+reference_docs/*.pdf.txt.meta.json
+reference_docs/*.pdf.txt.*.tmp
+reference_docs/*.articles.json
+reference_docs/*.articles.json.tmp

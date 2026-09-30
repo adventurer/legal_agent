@@ -41,8 +41,8 @@ class ReviewItem(BaseModel):
         description="审查的条款主题或违约点（如：乙方逾期交货的违约金比例）"
     )
     risk_level: RiskLevel = Field(
-        default=RiskLevel.MEDIUM, 
-        description="风险严重程度: High / Medium / Low"
+        default=RiskLevel.LOW,
+        description="与法律规范冲突为 High；可能导致合同无法履行为 Medium；其他为 Low"
     )
     legal_basis: str = Field(
         ..., 
@@ -105,8 +105,14 @@ class ReviewRequest(BaseModel):
         description="ReAct 推理最大轮次限制"
     )
     stream: Optional[bool] = Field(
-        default=True, 
+        default=True,
         description="是否启用打字机流式输出"
+    )
+    review_run_id: Optional[str] = Field(
+        default=None,
+        min_length=1,
+        max_length=80,
+        description="同一轮多条款审查共享的追踪批次 ID",
     )
 
 

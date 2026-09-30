@@ -15,6 +15,7 @@
 
 import os
 import sys
+import json
 import argparse
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -22,7 +23,7 @@ from typing import Optional, Dict, Any, List
 import re
 import uuid
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
 
@@ -55,6 +56,8 @@ from gateway.review_orchestrator import (
     generate_kb_deficit_recommendation,
 )
 from services.contract_rewriter import rewrite_selected_clauses
+from services.review_trace import ReviewTrace
+from gateway.model_runtime import model_runtime
 
 app = FastAPI(
     title="Legal Agent Lab API Gateway",
@@ -87,6 +90,7 @@ def normalize_clauses_output(raw_clauses: Any) -> List[Dict[str, Any]]:
                 "index": c.get("index", i + 1),
                 "title": c.get("title", f"条款 {i + 1}"),
                 "content": c.get("content", ""),
+                "raw_text": c.get("raw_text", ""),
                 "type": c.get("type", "article"),
             })
         else:
@@ -94,6 +98,7 @@ def normalize_clauses_output(raw_clauses: Any) -> List[Dict[str, Any]]:
                 "index": getattr(c, "index", i + 1),
                 "title": getattr(c, "title", f"条款 {i + 1}"),
                 "content": getattr(c, "content", str(c)),
+                "raw_text": getattr(c, "raw_text", ""),
                 "type": getattr(c, "type", "article"),
             })
     return formatted
@@ -101,12 +106,61 @@ def normalize_clauses_output(raw_clauses: Any) -> List[Dict[str, Any]]:
 
 @app.get("/health")
 async def health_check():
+    from gateway import review_orchestrator as orchestrator_module
+
+    runtime_status = model_runtime.status()
+    unavailable_tools = getattr(agent_instance.tool_registry, "unavailable_tools", set())
     return {
         "status": "healthy",
         "model": agent_instance.model_name,
-        "tools_ready": list(agent_instance.tool_mapping.keys()),
-        "context_threshold_95": CONTEXT_THRESHOLD_95,
+        "inference_model": runtime_status.get("model"),
+        "model_matches_inference": runtime_status.get("model") == agent_instance.model_name,
+        "tools_ready": [
+            name for name in agent_instance.tool_mapping if name not in unavailable_tools
+        ],
+        "tools_unavailable": sorted(unavailable_tools),
+        "knowledge_base_pages": len(
+            getattr(agent_instance.tool_registry.knowledge_base, "pages", []) or []
+        ),
+        "context_threshold_95": orchestrator_module.CONTEXT_THRESHOLD_95,
     }
+
+
+@app.get("/api/v1/model-runtime")
+async def get_model_runtime():
+    return model_runtime.status()
+
+
+@app.get("/api/v1/models")
+async def get_supported_models():
+    from configs.config import MODEL_PRESETS
+
+    return {
+        "models": [
+            {"key": key, "name": preset["served_name"], "context": preset["max_model_len"]}
+            for key, preset in MODEL_PRESETS.items()
+        ]
+    }
+
+
+@app.post("/api/v1/model-runtime/start")
+async def start_model_runtime(payload: Dict[str, str] = Body(...)):
+    try:
+        return model_runtime.start(payload.get("model_key", ""))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"无法启动模型服务：{exc}") from exc
+
+
+@app.post("/api/v1/model-runtime/stop")
+async def stop_model_runtime():
+    try:
+        return model_runtime.stop()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 @app.post("/api/v1/sessions/create")
@@ -158,14 +212,82 @@ async def upload_contract(
 
 @app.post("/api/v1/contract/review/stream")
 async def review_contract_stream(request: ReviewRequest):
+    # A vLLM process may have been started from a terminal rather than the page.
+    # Reconcile its served name before constructing any model requests.
+    runtime_status = model_runtime.status()
+    inference_model = runtime_status.get("model")
+    if not inference_model:
+        raise HTTPException(status_code=503, detail="vLLM 推理服务不可用，请先启动模型服务。")
+    if inference_model != agent_instance.model_name:
+        raise HTTPException(
+            status_code=503,
+            detail=(
+                f"网关模型同步失败：网关配置为 {agent_instance.model_name}，"
+                f"但 vLLM 当前提供 {inference_model}。请刷新网关服务状态或重启网关。"
+            ),
+        )
     limit_turns = request.max_turns or AGENT_CONFIG.get("max_turns", 6)
     clause_title_match = re.search(
         r"^(第[一二三四五六七八九十百0-9]+条[^\n]+|合同前言[^\n]*)",
         request.contract_text.strip(),
     )
     task_label = clause_title_match.group(1).strip() if clause_title_match else f"Task-{uuid.uuid4().hex[:6]}"
+    review_run_id = request.review_run_id or uuid.uuid4().hex
+
+    try:
+        trace = ReviewTrace(
+            DATA_DIR / "review_logs",
+            contract_text=request.contract_text,
+            max_turns=limit_turns,
+            model=agent_instance.model_name,
+            task_label=task_label,
+            review_run_id=review_run_id,
+        )
+        print(f"[*] 审查调试记录: {trace.path}", flush=True)
+    except OSError as exc:
+        print(f"[警告] 无法创建审查调试记录: {exc}", flush=True)
+        trace = None
+
+    async def traced_stream():
+        trace_status = "interrupted"
+        try:
+            async for item in review_orchestrator.stream(
+                request.contract_text, limit_turns, task_label
+            ):
+                if item.get("event") == "start" and trace:
+                    try:
+                        payload = json.loads(item.get("data", "{}"))
+                        payload["trace_id"] = trace.trace_id
+                        item = {**item, "data": json.dumps(payload, ensure_ascii=False)}
+                    except (TypeError, ValueError):
+                        pass
+                if trace:
+                    trace.record_sse(item)
+                if item.get("event") == "final_report":
+                    try:
+                        result = json.loads(item.get("data", "{}"))
+                        trace_status = result.get("status", "completed") if result.get("is_complete") else "incomplete"
+                    except (TypeError, ValueError):
+                        trace_status = "incomplete"
+                elif item.get("event") == "error":
+                    trace_status = "error"
+                elif item.get("event") == "done" and trace_status == "interrupted":
+                    trace_status = "finished_without_final_report"
+                yield item
+        except Exception as exc:
+            trace_status = "error"
+            if trace:
+                trace.record_sse({
+                    "event": "gateway_exception",
+                    "data": json.dumps({"error": str(exc)}, ensure_ascii=False),
+                })
+            raise
+        finally:
+            if trace:
+                trace.close(trace_status)
+
     return EventSourceResponse(
-        review_orchestrator.stream(request.contract_text, limit_turns, task_label)
+        traced_stream()
     )
 
 

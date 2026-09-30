@@ -1,0 +1,82 @@
+[
+  {
+    "file": "gongsi_fa_2023.law.txt",
+    "title": "中华人民共和国公司法（2023修订）",
+    "source_url": "https://www.gov.cn/yaowen/liebiao/202312/content_6923395.htm",
+    "effective_date": "2024-07-01",
+    "retrieval_date": "2026-09-30",
+    "chars": 33207
+  },
+  {
+    "file": "geren_xinxi_baohu_fa.law.txt",
+    "title": "中华人民共和国个人信息保护法",
+    "source_url": "https://www.cac.gov.cn/2021-08/20/c_1631050028355286.htm",
+    "effective_date": "2021-11-01",
+    "retrieval_date": "2026-09-30",
+    "chars": 9942
+  },
+  {
+    "file": "wangluo_anquan_fa_2025.law.txt",
+    "title": "中华人民共和国网络安全法（2025年修正）",
+    "source_url": "https://www.cac.gov.cn/2025-12/29/c_1768735112911946.htm",
+    "effective_date": "2026-01-01",
+    "retrieval_date": "2026-09-30",
+    "chars": 11604
+  },
+  {
+    "file": "zhongcai_fa_2025.law.txt",
+    "title": "中华人民共和国仲裁法（2025修订）",
+    "source_url": "https://policy.mofcom.gov.cn/claw/clawContent.shtml?id=103718",
+    "effective_date": "2026-03-01",
+    "retrieval_date": "2026-09-30",
+    "chars": 10362
+  },
+  {
+    "file": "fan_buzhengdang_jingzheng_fa_2025.law.txt",
+    "title": "中华人民共和国反不正当竞争法（2025修订）",
+    "source_url": "https://zscqj.beijing.gov.cn/zscqj/zwgk/flfg18/436481051/index.html",
+    "effective_date": "2025-10-15",
+    "retrieval_date": "2026-09-30",
+    "chars": 7917
+  },
+  {
+    "file": "zhuanli_fa.law.txt",
+    "title": "中华人民共和国专利法（2020修正）",
+    "source_url": "https://www.cnipa.gov.cn/art/2020/11/23/art_97_155167.html",
+    "effective_date": "2021-06-01",
+    "retrieval_date": "2026-09-30",
+    "chars": 11452
+  },
+  {
+    "file": "chanpin_zhiliang_fa.law.txt",
+    "title": "中华人民共和国产品质量法",
+    "source_url": "https://www.samr.gov.cn/zfjcj/tzgg/art/2023/art_579118cd202a45fba28b7edfd9f6fd72.html",
+    "effective_date": "2018-12-29",
+    "retrieval_date": "2026-09-30",
+    "chars": 8893
+  },
+  {
+    "file": "dianzi_shangwu_fa.law.txt",
+    "title": "中华人民共和国电子商务法",
+    "source_url": "https://www.samr.gov.cn/wljys/gzzd/art/2023/art_3e75434c954b4cb9bd14867dacff26d1.html",
+    "effective_date": "2019-01-01",
+    "retrieval_date": "2026-09-30",
+    "chars": 10895
+  },
+  {
+    "file": "dianzi_qianming_fa.law.txt",
+    "title": "中华人民共和国电子签名法",
+    "source_url": "https://www.beijing.gov.cn/zhengce/zhengcefagui/202202/t20220208_2606143.html",
+    "effective_date": "2019-04-23",
+    "retrieval_date": "2026-09-30",
+    "chars": 4673
+  },
+  {
+    "file": "fanlongduan_fa_2022.law.txt",
+    "title": "中华人民共和国反垄断法（2022修正）",
+    "source_url": "https://www.samr.gov.cn/zw/zfxxgk/fdzdgknr/fgs/art/2023/art_f0fae9eb3a684fc39e84d89eabfc2caa.html",
+    "effective_date": "2022-08-01",
+    "retrieval_date": "2026-09-30",
+    "chars": 8728
+  }
+]

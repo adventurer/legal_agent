@@ -1,5 +1,6 @@
 """Search scoring and presentation for enterprise review rules."""
 
+import re
 from typing import Any, Iterable, List
 
 
@@ -18,15 +19,21 @@ def search_rules(rows: Iterable[Any], query: str, top_k: int = 2) -> str:
     scored = []
     for row in rows:
         score = 0
-        for token in tokens:
-            if token in row["topic"]:
-                score += 5
-            if token in row["keywords"]:
-                score += 3
-            if token in row["standard_requirement"]:
-                score += 1
-            if token in (row["forbidden_pattern"] or ""):
-                score += 1
+        row_keywords = [
+            keyword.strip().lower()
+            for keyword in re.split(r"[,，;；、\s]+", row["keywords"] or "")
+            if keyword.strip()
+        ]
+        normalized_query = query.strip().lower()
+        normalized_tokens = [token.lower() for token in tokens]
+        score += sum(5 for token in normalized_tokens if token in row["topic"].lower())
+        score += sum(3 for keyword in row_keywords if keyword in normalized_query)
+        searchable = " ".join([
+            row["standard_requirement"] or "",
+            row["forbidden_pattern"] or "",
+            row["recommended_clause"] or "",
+        ]).lower()
+        score += sum(1 for token in normalized_tokens if token in searchable)
         if score:
             scored.append((score, row))
     if not scored:

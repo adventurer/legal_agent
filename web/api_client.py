@@ -30,7 +30,8 @@ def upload_contract_file(
         f"{base_url}/api/v1/contract/upload",
         files=files,
         data=data,
-        timeout=30.0,
+        # Parsing may include OCR or a 120-second LibreOffice conversion.
+        timeout=httpx.Timeout(connect=10.0, read=240.0, write=240.0, pool=10.0),
     )
     response.raise_for_status()
     return response.json()

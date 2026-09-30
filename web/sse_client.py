@@ -11,6 +11,7 @@ def stream_contract_review(
     base_url: str,
     contract_text: str,
     max_turns: int,
+    review_run_id: str | None = None,
     timeout: float = 180.0,
 ) -> Iterator[Dict[str, Any]]:
     """请求合同审查流，并将 SSE 事件转换为字典。"""
@@ -20,6 +21,8 @@ def stream_contract_review(
             "max_turns": max_turns,
             "stream": True,
         }
+        if review_run_id:
+            payload["review_run_id"] = review_run_id
         with connect_sse(
             client,
             "POST",

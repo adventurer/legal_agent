@@ -10,8 +10,14 @@
 
 import sys
 import time
+import os
+import subprocess
+import psutil
 import html
+import hashlib
+import json
 import re
+import uuid
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,7 +26,8 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
 import streamlit as st
-from services.report_parser import clean_report_content
+import httpx
+from services.report_parser import clean_report_content, parse_structured_report
 from web.api_client import check_gateway_health as fetch_gateway_health
 from web.api_client import upload_contract_file as send_contract_file
 from web.contract_client import rewrite_contract
@@ -28,6 +35,9 @@ from web.report_exporter import report_to_docx
 from web.sse_client import stream_contract_review
 
 API_BASE_URL = "http://127.0.0.1:9000"
+GATEWAY_SCRIPT = ROOT_DIR / "gateway" / "api_server.py"
+GATEWAY_LOG = ROOT_DIR / "data" / "gateway.log"
+_gateway_process: Optional[subprocess.Popen] = None
 
 # ==================== 1. 页面配置与样式注入 ====================
 st.set_page_config(
@@ -123,6 +133,12 @@ if "full_contract_text" not in st.session_state:
     st.session_state.full_contract_text = ""
 if "final_report" not in st.session_state:
     st.session_state.final_report = ""
+if "structured_report" not in st.session_state:
+    st.session_state.structured_report = None
+if "evidence_records" not in st.session_state:
+    st.session_state.evidence_records = {}
+if "consistency_checks" not in st.session_state:
+    st.session_state.consistency_checks = []
 if "is_reviewing" not in st.session_state:
     st.session_state.is_reviewing = False
 if "truncation_warning" not in st.session_state:
@@ -143,6 +159,83 @@ def check_gateway_health() -> Dict[str, Any]:
         return fetch_gateway_health(API_BASE_URL)
     except Exception:
         return {"status": "unreachable"}
+
+
+def start_gateway_process() -> subprocess.Popen:
+    """Start the local API gateway from the Streamlit process."""
+    global _gateway_process
+    if _gateway_process is not None and _gateway_process.poll() is None:
+        return _gateway_process
+    GATEWAY_LOG.parent.mkdir(parents=True, exist_ok=True)
+    log_handle = open(GATEWAY_LOG, "a", encoding="utf-8")
+    kwargs = {
+        "cwd": str(ROOT_DIR),
+        "stdout": log_handle,
+        "stderr": subprocess.STDOUT,
+        "stdin": subprocess.DEVNULL,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = subprocess.DETACHED_PROCESS
+    else:
+        kwargs["start_new_session"] = True
+    _gateway_process = subprocess.Popen(
+        [sys.executable, str(GATEWAY_SCRIPT)], **kwargs
+    )
+    # The child owns the duplicated file descriptor after Popen returns.
+    log_handle.close()
+    return _gateway_process
+
+
+def restart_gateway_process() -> subprocess.Popen:
+    """Restart this project's gateway, whether page-managed or terminal-started."""
+    global _gateway_process
+    response = httpx.get(f"{API_BASE_URL}/openapi.json", timeout=3.0)
+    response.raise_for_status()
+    if response.json().get("info", {}).get("title") != "Legal Agent Lab API Gateway":
+        raise RuntimeError("9000 端口运行的服务不是本项目网关，已取消重启。")
+
+    gateway_port = int(API_BASE_URL.rsplit(":", 1)[1])
+    listener_pids = {
+        connection.pid
+        for connection in psutil.net_connections(kind="inet")
+        if connection.status == psutil.CONN_LISTEN
+        and connection.laddr
+        and connection.laddr.port == gateway_port
+        and connection.pid
+        and connection.pid != os.getpid()
+    }
+    if _gateway_process is not None and _gateway_process.poll() is None:
+        listener_pids.add(_gateway_process.pid)
+    if not listener_pids:
+        raise RuntimeError("无法定位网关进程；请检查当前用户是否有权限管理该进程。")
+
+    processes = []
+    for pid in listener_pids:
+        try:
+            process = psutil.Process(pid)
+            process.terminate()
+            processes.append(process)
+        except psutil.NoSuchProcess:
+            continue
+    _, alive = psutil.wait_procs(processes, timeout=10)
+    for process in alive:
+        process.kill()
+    if alive:
+        psutil.wait_procs(alive, timeout=3)
+    _gateway_process = None
+
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        still_listening = any(
+            connection.status == psutil.CONN_LISTEN
+            and connection.laddr
+            and connection.laddr.port == gateway_port
+            for connection in psutil.net_connections(kind="inet")
+        )
+        if not still_listening:
+            break
+        time.sleep(0.2)
+    return start_gateway_process()
 
 
 def upload_contract_file(uploaded_file, session_id: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -184,13 +277,79 @@ def render_reasoning_text(text: str) -> str:
 def show_clause_content(title: str, content: str) -> None:
     """Display the complete clause text in a modal dialog."""
     st.markdown(f"#### {title}")
+    st.caption(f"以下是单条审查提交给大模型的完整正文（{len(content)} 字符）。")
     st.text_area(
-        "条款正文",
+        "单条审查发送正文",
         value=content or "该条款暂无正文内容。",
         height=360,
         disabled=True,
         label_visibility="collapsed",
     )
+
+
+def clause_review_text(clause: Dict[str, Any]) -> str:
+    """Return the canonical clause text used both for display and model input."""
+    raw_text = clause.get("raw_text")
+    if isinstance(raw_text, str) and raw_text.strip():
+        return raw_text.strip()
+    title = str(clause.get("title", "")).strip()
+    content = str(clause.get("content", "")).strip()
+    if title and content and not content.startswith(title):
+        return f"{title}\n{content}"
+    return content or title
+
+
+@st.dialog("依据原文")
+def show_evidence_content(evidence: Dict[str, Any]) -> None:
+    article = evidence.get("article_no") or "文档片段"
+    title = evidence.get("title")
+    st.markdown(f"#### {evidence.get('doc_name', '参考文档')} · {article}{f' {title}' if title else ''}")
+    st.caption(f"来源页码：{evidence.get('page_start', '?')}" + (f"–{evidence['page_end']}" if evidence.get("page_end") != evidence.get("page_start") else ""))
+    st.text_area("命中条款原文（文本提取）", value=evidence.get("text", ""), height=420, disabled=True)
+
+
+def collect_evidence(observation: str, destination: Optional[Dict[str, Any]] = None) -> None:
+    """Read evidence records from the JSON returned by a knowledge search tool."""
+    target = destination if destination is not None else st.session_state.evidence_records
+    try:
+        payload = json.loads(observation)
+    except (json.JSONDecodeError, TypeError):
+        return
+    for evidence in payload.get("evidence", []):
+        if evidence.get("id"):
+            target[evidence["id"]] = evidence
+
+
+def format_report_evidence_refs(
+    report: str, evidence_records: Optional[Dict[str, Dict[str, Any]]] = None
+) -> str:
+    """Replace internal evidence IDs with readable source titles and page numbers."""
+    records = evidence_records or {}
+    document_titles = {
+        "minfadian": "中华人民共和国民法典",
+        "minshishusongfa": "中华人民共和国民事诉讼法",
+        "zhongcaifa": "中华人民共和国仲裁法",
+    }
+
+    def replace_reference(match: re.Match) -> str:
+        evidence = records.get(match.group(1), {})
+        raw_name = str(evidence.get("doc_name", "")).strip()
+        if not raw_name:
+            return ""
+        stem = Path(raw_name).stem
+        if stem.lower().endswith(".pdf"):
+            stem = Path(stem).stem
+        title = document_titles.get(stem.lower(), stem or "检索依据")
+        page_start = evidence.get("page_start")
+        page_end = evidence.get("page_end", page_start)
+        if page_start is None:
+            return f"《{title}》"
+        page_label = f"第 {page_start} 页"
+        if page_end is not None and page_end != page_start:
+            page_label += f"–{page_end} 页"
+        return f"《{title}》（{page_label}）"
+
+    return re.sub(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", replace_reference, report or "")
 
 
 # ==================== 4. 顶部控制栏 ====================
@@ -201,10 +360,126 @@ with header_col:
 
 with status_col:
     health = check_gateway_health()
-    if health.get("status") == "healthy":
-        st.success(f"🟢 服务就绪 ({health.get('model', 'qwen2.5')})")
+
+try:
+    runtime_response = httpx.get(f"{API_BASE_URL}/api/v1/model-runtime", timeout=3.0)
+    runtime_response.raise_for_status()
+    runtime_status = runtime_response.json()
+    models_response = httpx.get(f"{API_BASE_URL}/api/v1/models", timeout=3.0)
+    models_response.raise_for_status()
+    available_models = models_response.json().get("models", [])
+except httpx.HTTPError:
+    runtime_status, available_models = {"state": "unavailable"}, []
+
+if health.get("status") == "healthy":
+    if runtime_status.get("state") == "running":
+        status_col.success(f"🟢 服务就绪 ({runtime_status.get('model') or health.get('model', 'qwen2.5')})")
+    elif runtime_status.get("state") == "starting":
+        status_col.info("🟡 模型服务启动中")
     else:
-        st.error("🔴 网关未启动 (请运行 api_server.py)")
+        status_col.warning("🟠 网关已启动，模型服务未运行")
+else:
+    status_col.error("🔴 网关未启动 (请运行 api_server.py)")
+
+with st.expander("🛠️ 服务管理", expanded=health.get("status") != "healthy"):
+    gateway_tab, model_tab = st.tabs(["网关服务", "推理模型"])
+    with gateway_tab:
+        if health.get("status") == "healthy":
+            st.success(f"网关运行中：{API_BASE_URL}")
+        elif _gateway_process is not None and _gateway_process.poll() is None:
+            st.info("网关正在启动，请稍后刷新状态。")
+        else:
+            st.caption("启动本地 FastAPI 网关后，可在推理模型页启动和切换模型。")
+
+        gateway_start_col, gateway_restart_col, gateway_refresh_col = st.columns([1, 1, 1])
+        with gateway_start_col:
+            if st.button(
+                "启动网关",
+                type="primary",
+                use_container_width=True,
+                disabled=health.get("status") == "healthy" or (
+                    _gateway_process is not None and _gateway_process.poll() is None
+                ),
+            ):
+                try:
+                    start_gateway_process()
+                    st.rerun()
+                except OSError as exc:
+                    st.error(f"网关启动失败：{exc}")
+        with gateway_restart_col:
+            if st.button(
+                "重启网关",
+                use_container_width=True,
+                disabled=health.get("status") != "healthy",
+            ):
+                try:
+                    restart_gateway_process()
+                    st.toast("网关已重启，稍后刷新状态。")
+                    st.rerun()
+                except (httpx.HTTPError, psutil.Error, OSError, RuntimeError) as exc:
+                    st.error(f"网关重启失败：{exc}")
+        with gateway_refresh_col:
+            if st.button("刷新网关状态", use_container_width=True):
+                st.rerun()
+        st.caption("网关日志：data/gateway.log")
+
+    with model_tab:
+        if available_models:
+            model_keys = [item["key"] for item in available_models]
+            selected_model = st.selectbox(
+                "推理模型",
+                model_keys,
+                format_func=lambda key: next(
+                    f"{item['name']} · {item['context']:,} tokens" for item in available_models if item["key"] == key
+                ),
+                index=model_keys.index(runtime_status["model_key"])
+                if runtime_status.get("model_key") in model_keys else 0,
+            )
+            current_state = runtime_status.get("state", "unknown")
+            if current_state == "running":
+                st.success(f"模型服务运行中：{runtime_status.get('model')}")
+            elif current_state == "starting":
+                st.info("模型正在启动或下载权重；点击刷新查看状态。")
+            else:
+                st.caption("模型服务已停止。启动后即可进行合同审查。")
+
+            start_col, stop_col, refresh_col = st.columns([1, 1, 1])
+            with start_col:
+                if st.button("启动 / 切换模型", type="primary", use_container_width=True):
+                    try:
+                        response = httpx.post(
+                            f"{API_BASE_URL}/api/v1/model-runtime/start",
+                            json={"model_key": selected_model},
+                            timeout=10.0,
+                        )
+                        response.raise_for_status()
+                        result = response.json()
+                        st.session_state.model_runtime_notice = (
+                            "模型服务正在启动；首次启动可能需要下载权重。" if result.get("state") == "starting"
+                            else f"已切换到 {result.get('model', selected_model)}。"
+                        )
+                        st.rerun()
+                    except httpx.HTTPError as exc:
+                        detail = exc.response.json().get("detail", str(exc)) if exc.response else str(exc)
+                        st.error(f"模型启动失败：{detail}")
+            with stop_col:
+                if st.button("停止模型服务", use_container_width=True, disabled=current_state != "running"):
+                    try:
+                        response = httpx.post(f"{API_BASE_URL}/api/v1/model-runtime/stop", timeout=12.0)
+                        response.raise_for_status()
+                        st.session_state.model_runtime_notice = "模型服务已停止。"
+                        st.rerun()
+                    except httpx.HTTPError as exc:
+                        detail = exc.response.json().get("detail", str(exc)) if exc.response else str(exc)
+                        st.error(f"停止失败：{detail}")
+            with refresh_col:
+                if st.button("刷新模型状态", use_container_width=True):
+                    st.rerun()
+            if notice := st.session_state.pop("model_runtime_notice", None):
+                st.toast(notice)
+            st.caption("启动参数：`python server/vllm_launcher.py --model <所选模型> --no-fp8-kv`；日志：data/vllm.log")
+        else:
+            st.warning("请先在网关服务页启动网关，待其运行后即可选择模型。")
 
 with st.container():
     st.markdown('<div class="top-control-panel">', unsafe_allow_html=True)
@@ -213,7 +488,7 @@ with st.container():
     with ctrl_col1:
         review_mode = st.radio(
             "审查策略：",
-            ["分条款并发精审 (推荐·高效防截断)", "全篇宏观快审 (整篇审查)"],
+            ["分条款并发精审 (推荐·高效防截断)", "全篇逐条审查 (单线程汇总)"],
             horizontal=False,
             index=0,
         )
@@ -235,6 +510,8 @@ with st.container():
             st.session_state.clauses = sample_clauses
             st.session_state.full_contract_text = "\n\n".join([f"{c['title']}\n{c['content']}" for c in sample_clauses])
             st.session_state.final_report = ""
+            st.session_state.structured_report = None
+            st.session_state.evidence_records = {}
             st.session_state.revised_contract = None
             st.session_state.revised_contract_signature = None
             st.session_state.circuit_breaks = []
@@ -249,10 +526,16 @@ with st.container():
     top_col1, top_col2 = st.columns([1, 2], gap="medium")
     with top_col1:
         uploaded_file = st.file_uploader(
-            "上传合同文件 (Word / PDF / 图片 / TXT)",
-            type=["docx", "doc", "pdf", "png", "jpg", "jpeg", "webp", "txt"],
+            "上传合同文件 (Word / PDF / 图片 / TXT / Markdown)",
+            type=["docx", "doc", "pdf", "png", "jpg", "jpeg", "webp", "bmp", "tiff", "txt", "md"],
         )
-        if uploaded_file is not None and st.session_state.get("last_uploaded_name") != uploaded_file.name:
+        upload_bytes = uploaded_file.getvalue() if uploaded_file is not None else b""
+        upload_signature = (
+            hashlib.sha256(
+                uploaded_file.name.encode("utf-8") + b"\0" + upload_bytes
+            ).hexdigest() if uploaded_file is not None else None
+        )
+        if uploaded_file is not None and st.session_state.get("last_uploaded_signature") != upload_signature:
             with st.spinner("正在执行多模态解析与条款切分..."):
                 res = upload_contract_file(uploaded_file, st.session_state.session_id)
                 if res and res.get("code") == 200:
@@ -260,8 +543,10 @@ with st.container():
                     st.session_state.session_id = data["session_id"]
                     st.session_state.clauses = data["clauses"]
                     st.session_state.full_contract_text = "\n\n".join([f"{c['title']}\n{c['content']}" for c in data["clauses"]])
-                    st.session_state.last_uploaded_name = uploaded_file.name
+                    st.session_state.last_uploaded_signature = upload_signature
                     st.session_state.final_report = ""
+                    st.session_state.structured_report = None
+                    st.session_state.evidence_records = {}
                     st.session_state.revised_contract = None
                     st.session_state.revised_contract_signature = None
                     st.session_state.circuit_breaks = []
@@ -277,7 +562,7 @@ with st.container():
             f"📑 条款明细与合同修订 (共 {len(st.session_state.clauses)} 个单元)",
             expanded=False,
         ):
-            st.caption("点击条款标题查看全文；勾选需要根据审查意见修订的条款。")
+            st.caption("点击条款标题查看全文；勾选需要根据审查意见修订的条款。导出的修订版是按解析文本重新排版的草稿，不保留原 Word/PDF 页面布局。")
             clause_cols = st.columns(2, gap="medium")
             for idx, c in enumerate(st.session_state.clauses):
                 col_target = clause_cols[idx % 2]
@@ -293,12 +578,12 @@ with st.container():
                         ):
                             show_clause_content(
                                 clause_title,
-                                c.get("content", ""),
+                                clause_review_text(c),
                             )
                     with c_col2:
                         if st.button("单独审查", key=f"btn_single_{c.get('index')}"):
                             selected_clause_idx = c.get("index")
-                    st.caption(c.get("content", "")[:120] + "...")
+                    st.caption(clause_review_text(c)[:120] + ("..." if len(clause_review_text(c)) > 120 else ""))
                     st.checkbox(
                         "纳入合同修订",
                         key=f"rewrite_clause_{c.get('index')}",
@@ -338,9 +623,9 @@ with st.container():
                             st.error(f"生成修订合同失败: {exc}")
 
             if st.session_state.revised_contract:
-                st.markdown("#### 📝 修订版合同预览")
+                st.markdown("#### 📝 修订文本草稿预览")
                 st.text_area(
-                    "修订版合同正文",
+                    "修订文本草稿正文",
                     value=st.session_state.revised_contract["contract_text"],
                     height=420,
                     disabled=True,
@@ -350,7 +635,7 @@ with st.container():
                 revised_filename = f"revised_contract_{int(time.time())}"
                 with revised_export_col1:
                     st.download_button(
-                        "📥 导出修订合同 Markdown",
+                        "📥 导出修订文本草稿 Markdown",
                         data=st.session_state.revised_contract["contract_text"],
                         file_name=f"{revised_filename}.md",
                         mime="text/markdown",
@@ -362,7 +647,7 @@ with st.container():
                             st.session_state.revised_contract["contract_text"]
                         )
                         st.download_button(
-                            "📄 导出修订合同 Word",
+                            "📄 导出修订文本草稿 Word",
                             data=revised_docx,
                             file_name=f"{revised_filename}.docx",
                             mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
@@ -377,8 +662,13 @@ st.markdown("<hr style='margin: 1.4rem 0; border: none; border-top: 1px solid #E
 
 
 # ==================== 6. 单通道 SSE 审查逻辑 ====================
-def execute_stream_review(text_to_review: str, target_name: str = "合同正文") -> Optional[str]:
+def execute_stream_review(
+    text_to_review: str,
+    target_name: str = "合同正文",
+    review_run_id: Optional[str] = None,
+) -> Optional[str]:
     st.session_state.is_reviewing = True
+    st.session_state.structured_report = None
     st.session_state.circuit_breaks = []
 
     status_box = st.status(f"正在初始化 ReAct 推理链路 ({target_name})...", expanded=True)
@@ -390,14 +680,20 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
 
     accumulated_tokens = ""
     extracted_final = ""
+    consistency_status_recorded = False
+    review_run_id = review_run_id or uuid.uuid4().hex
 
     try:
-        for sse in stream_contract_review(API_BASE_URL, text_to_review, max_turns):
+        for sse in stream_contract_review(
+            API_BASE_URL, text_to_review, max_turns, review_run_id=review_run_id
+        ):
             event = sse["event"]
             data = sse["data"]
 
             if event == "start":
                 status_box.update(label=f"[{data.get('task_id', target_name)}] 正在制定审查策略...")
+                if data.get("trace_id"):
+                    status_box.write(f"🧾 调试记录 ID：`{data['trace_id']}`（项目目录下的 data/review_logs/review_trace.jsonl）")
             elif event == "token":
                 accumulated_tokens += data.get("token", "")
                 thought_container.markdown(
@@ -407,7 +703,18 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
             elif event == "tool_start":
                 status_box.write(f"🔧 **调度工具** `{data.get('tool')}`: 检索 *'{data.get('query')}'*")
             elif event == "tool_result":
+                collect_evidence(data.get("observation", ""))
                 status_box.write("📖 **已检索依据并注入模型工作记忆**")
+            elif event == "validation_start":
+                status_box.write("🔎 正在逐项核对原文子条款、合同事实与检索依据…")
+            elif event == "validation_complete":
+                status_box.write(f"✅ {data.get('message', '最终一致性检查完成')}")
+                st.session_state.consistency_checks.append({"status": "passed", "message": data.get("message", "最终一致性检查完成")})
+                consistency_status_recorded = True
+            elif event == "validation_failed":
+                status_box.write(f"⚠️ {data.get('message', '最终一致性检查未完成，保留初稿')}")
+                st.session_state.consistency_checks.append({"status": "failed", "message": data.get("message", "最终一致性检查未完成，保留初稿")})
+                consistency_status_recorded = True
             elif event == "circuit_break":
                 st.session_state.circuit_breaks.append(data)
                 recs_markdown = "\n".join([f"- **{r}**" for r in data.get("recommendations", [])])
@@ -429,8 +736,28 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
                     f"<span class='meta-badge'>输出: {data.get('output_chars')} 字 ({data.get('generated_tokens')} Tks)</span>",
                     unsafe_allow_html=True,
                 )
+            elif event == "error":
+                status_box.update(
+                    label=f"❌ 审查失败：{data.get('error', '网关返回错误')}",
+                    state="error",
+                    expanded=True,
+                )
+                return None
             elif event == "final_report":
+                if not data.get("is_complete", data.get("status") == "success"):
+                    status_box.update(
+                        label="⚠️ 审查未完整完成，结果未保存",
+                        state="error",
+                        expanded=True,
+                    )
+                    return None
                 extracted_final = data.get("raw_report", "")
+                st.session_state.structured_report = data.get("structured_report")
+                if not data.get("consistency_checked") and not consistency_status_recorded:
+                    st.session_state.consistency_checks.append({
+                        "status": "failed",
+                        "message": data.get("consistency_message", "该报告未完成最终一致性检查"),
+                    })
                 status_box.update(
                     label="✅ 审查完成！",
                     state="complete",
@@ -439,8 +766,9 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
             elif event == "done":
                 break
 
-        if not extracted_final and "Final:" in accumulated_tokens:
-            extracted_final = accumulated_tokens.split("Final:", 1)[1].strip()
+        if not extracted_final:
+            status_box.update(label="⚠️ 未收到完整审查报告", state="error", expanded=True)
+            return None
 
         st.session_state.is_reviewing = False
         return clean_report_content(extracted_final or accumulated_tokens)
@@ -451,54 +779,83 @@ def execute_stream_review(text_to_review: str, target_name: str = "合同正文"
 
 
 # ==================== 7. 多线程并发调度器 ====================
-def _worker_clause_review(clause: Dict[str, Any], turns: int) -> Dict[str, Any]:
-    clause_text = f"{clause['title']}\n{clause['content']}"
+def _worker_clause_review(
+    clause: Dict[str, Any], turns: int, review_run_id: str
+) -> Dict[str, Any]:
+    clause_text = clause_review_text(clause)
     accumulated_tokens = ""
     extracted_final = ""
+    final_complete = False
     logs = []
+    evidence_records: Dict[str, Any] = {}
+    consistency_checks = []
     circuit_break_info = None
 
     try:
-        for sse in stream_contract_review(API_BASE_URL, clause_text, turns):
+        for sse in stream_contract_review(
+            API_BASE_URL, clause_text, turns, review_run_id=review_run_id
+        ):
             event = sse["event"]
             data = sse["data"]
-            if event == "token":
+            if event == "start" and data.get("trace_id"):
+                logs.append(f"调试记录 ID: {data['trace_id']}")
+            elif event == "token":
                 accumulated_tokens += data.get("token", "")
+            elif event == "duplicate_action_reused":
+                logs.append(data.get("message", "检测到重复检索，已复用原结果"))
             elif event == "circuit_break":
                 circuit_break_info = data
                 logs.append(f"⚠️ 触发熔断: {data.get('reason_type')}")
             elif event == "tool_start":
                 logs.append(f"检索: {data.get('query')}")
+            elif event == "tool_result":
+                collect_evidence(data.get("observation", ""), evidence_records)
+            elif event == "validation_complete":
+                logs.append(data.get("message", "最终一致性检查完成"))
+                consistency_checks.append({"status": "passed", "message": data.get("message", "最终一致性检查完成")})
+            elif event == "validation_failed":
+                logs.append(data.get("message", "最终一致性检查未完成"))
+                consistency_checks.append({"status": "failed", "message": data.get("message", "最终一致性检查未完成")})
             elif event == "final_report":
                 extracted_final = data.get("raw_report", "")
+                final_complete = data.get("is_complete", data.get("status") == "success")
+                if not data.get("consistency_checked") and not consistency_checks:
+                    consistency_checks.append({
+                        "status": "failed",
+                        "message": data.get("consistency_message", "该报告未完成一致性检查"),
+                    })
+            elif event == "error":
+                raise RuntimeError(data.get("error", "网关返回错误"))
             elif event == "done":
                 break
 
-        report_content = clean_report_content(
-            extracted_final
-            or (
-                accumulated_tokens.split("Final:", 1)[-1].strip()
-                if "Final:" in accumulated_tokens
-                else accumulated_tokens
-            )
-        )
+        if not extracted_final or not final_complete:
+            raise RuntimeError("未收到完整的最终审查报告")
+        report_content = clean_report_content(extracted_final)
         return {
             "index": clause.get("index", 0),
             "title": clause.get("title", ""),
             "report": report_content,
             "logs": logs,
             "circuit_break": circuit_break_info,
-            "success": True,
+            "evidence_records": evidence_records,
+            "consistency_checks": consistency_checks,
+            "success": bool(report_content),
         }
     except Exception as e:
-        return {"index": clause.get("index", 0), "title": clause.get("title", ""), "report": f"审查异常: {e}", "logs": [str(e)], "circuit_break": None, "success": False}
+        return {"index": clause.get("index", 0), "title": clause.get("title", ""), "report": f"审查异常: {e}", "logs": [str(e)], "circuit_break": None, "evidence_records": evidence_records, "consistency_checks": consistency_checks, "success": False}
 
 
 def execute_concurrent_clause_review(
-    clauses_to_review: List[Dict[str, Any]], max_workers: int
+    clauses_to_review: List[Dict[str, Any]], max_workers: int,
+    review_run_id: Optional[str] = None,
 ) -> str:
     st.session_state.is_reviewing = True
+    st.session_state.structured_report = None
     st.session_state.circuit_breaks = []
+    st.session_state.evidence_records = {}
+    st.session_state.consistency_checks = []
+    review_run_id = review_run_id or uuid.uuid4().hex
     total_count = len(clauses_to_review)
 
     st.markdown(f"##### ⚡ 正在启用 {max_workers} 路线程并发审查 (共 {total_count} 个条款)...")
@@ -516,7 +873,10 @@ def execute_concurrent_clause_review(
     completed_count = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {executor.submit(_worker_clause_review, c, max_turns): c["index"] for c in clauses_to_review}
+        future_map = {
+            executor.submit(_worker_clause_review, c, max_turns, review_run_id): c["index"]
+            for c in clauses_to_review
+        }
         for future in as_completed(future_map):
             c_idx = future_map[future]
             res = future.result()
@@ -525,6 +885,8 @@ def execute_concurrent_clause_review(
 
             if res.get("circuit_break"):
                 st.session_state.circuit_breaks.append(res["circuit_break"])
+            st.session_state.evidence_records.update(res.get("evidence_records", {}))
+            st.session_state.consistency_checks.extend(res.get("consistency_checks", []))
 
             card = status_placeholders.get(c_idx)
             if card:
@@ -556,39 +918,44 @@ with st.container():
     if selected_clause_idx is not None:
         target_clause = next((c for c in st.session_state.clauses if c.get("index") == selected_clause_idx), None)
         if target_clause:
-            target_text = f"{target_clause['title']}\n{target_clause['content']}"
+            st.session_state.evidence_records = {}
+            st.session_state.consistency_checks = []
+            target_text = clause_review_text(target_clause)
             report = execute_stream_review(target_text, target_name=target_clause["title"])
             if report:
                 st.session_state.final_report = f"## 针对【{target_clause['title']}】的专属审查意见\n\n" + report
                 st.rerun()
 
     elif start_full_review:
+        st.session_state.evidence_records = {}
+        st.session_state.consistency_checks = []
+        review_run_id = uuid.uuid4().hex
         if not st.session_state.full_contract_text.strip():
             st.warning("请先上传合同文件或载入样例数据！")
         else:
-            if "并发精审" in review_mode and st.session_state.clauses:
-                article_clauses = [c for c in st.session_state.clauses if c.get("type") == "article"] or st.session_state.clauses
-                if concurrency == 1:
-                    total_articles = len(article_clauses)
-                    aggregated_reports = []
-                    progress_bar = st.progress(0, text="单路条款逐条精审中...")
-                    for idx, clause in enumerate(article_clauses):
-                        progress_bar.progress((idx + 1) / total_articles, text=f"正在精审 ({idx+1}/{total_articles}): {clause['title']}")
-                        report_part = execute_stream_review(f"{clause['title']}\n{clause['content']}", target_name=clause["title"])
-                        if report_part:
-                            aggregated_reports.append(f"### 条款 {clause['index']}: {clause['title']}\n\n{report_part}\n\n---")
-                    progress_bar.empty()
-                    st.session_state.final_report = "# 综合合同审查终审报告 (逐条精审汇总)\n\n" + "\n\n".join(aggregated_reports)
-                    st.rerun()
-                else:
-                    final_aggregated = execute_concurrent_clause_review(article_clauses, max_workers=concurrency)
-                    st.session_state.final_report = final_aggregated
-                    st.rerun()
-            else:
-                report = execute_stream_review(st.session_state.full_contract_text, target_name="全篇合同全文")
-                if report:
-                    st.session_state.final_report = report
-                    st.rerun()
+            # Keep the full-contract report and the per-clause report on the
+            # same source of truth: review each clause once, then assemble the
+            # whole report from those exact results. A separate full-text model
+            # pass could invent omissions or conclusions that contradict them.
+            article_clauses = [
+                c for c in st.session_state.clauses if c.get("type") == "article"
+            ] or st.session_state.clauses
+            if not article_clauses:
+                article_clauses = [{
+                    "index": 1,
+                    "type": "article",
+                    "title": "全篇合同",
+                    "content": st.session_state.full_contract_text,
+                }]
+
+            workers = concurrency if "并发精审" in review_mode else 1
+            st.session_state.final_report = execute_concurrent_clause_review(
+                article_clauses,
+                max_workers=workers,
+                review_run_id=review_run_id,
+            )
+            st.session_state.structured_report = None
+            st.rerun()
 
     # 渲染前端收集到的所有熔断告警与知识库增补清单
     if st.session_state.circuit_breaks:
@@ -608,24 +975,124 @@ with st.container():
 
     # 渲染 Markdown 报告
     if st.session_state.final_report:
-        st.markdown('<div class="report-card">', unsafe_allow_html=True)
-        st.markdown(clean_report_content(st.session_state.final_report))
-        st.markdown('</div>', unsafe_allow_html=True)
+        check_results = st.session_state.consistency_checks
+        failed_checks = [item for item in check_results if item.get("status") != "passed"]
+        if check_results and failed_checks:
+            st.warning(f"最终一致性检查未完成或未通过：{len(failed_checks)}/{len(check_results)} 个条款。初稿可能仍有事实冲突或依据错配，请优先复核。")
+        elif check_results:
+            st.info(f"已执行 {len(check_results)} 个条款的一致性复核；引用依据仍请结合原文核对。")
+        evidence_records = st.session_state.evidence_records
+        if evidence_records:
+            with st.expander(f"📚 本次检索依据（{len(evidence_records)} 条，点击查看命中原文）", expanded=True):
+                for evidence_id, evidence in evidence_records.items():
+                    citation = f"《{evidence.get('doc_name', '参考文档')}》"
+                    if evidence.get("article_no"):
+                        citation += f" {evidence['article_no']}"
+                    if evidence.get("title"):
+                        citation += f" {evidence['title']}"
+                    citation += f" · 第 {evidence.get('page_start', '?')} 页"
+                    if st.button(f"查看原文：{citation}", key=f"all_evidence_{evidence_id}"):
+                        show_evidence_content(evidence)
+        else:
+            st.info("本次审查没有收集到法规原文证据。若报告列出了法条依据，请确认法规检索工具已成功返回结果后重新审查。")
+        if st.session_state.structured_report is None:
+            parsed_report = parse_structured_report(st.session_state.final_report)
+            if parsed_report:
+                st.session_state.structured_report = parsed_report.model_dump(mode="json")
+        structured_reviews = (st.session_state.structured_report or {}).get("reviews", [])
+        if structured_reviews:
+            st.caption(
+                "分级标准：与适用法律规范冲突为高风险；可能导致合同无法履行为中风险；其他为低风险。"
+            )
+            risk_levels = [
+                ("High", "高风险"),
+                ("Medium", "中风险"),
+                ("Low", "低风险"),
+            ]
+            counts = {
+                level: sum(
+                    1 for item in structured_reviews
+                    if str(item.get("risk_level", "")).lower() == level.lower()
+                )
+                for level, _ in risk_levels
+            }
+            risk_tabs = st.tabs([
+                f"{label}（{counts[level]}）" for level, label in risk_levels
+            ])
+            for tab, (level, label) in zip(risk_tabs, risk_levels):
+                with tab:
+                    items = [
+                        item for item in structured_reviews
+                        if str(item.get("risk_level", "")).lower() == level.lower()
+                    ]
+                    if not items:
+                        st.info(f"当前报告没有{label}条款。")
+                    for index, item in enumerate(items, 1):
+                        st.markdown(f"#### {index}. {item.get('clause_topic', '未命名条款')}")
+                        st.markdown(f"**风险等级：** {label}")
+                        legal_basis = item.get("legal_basis", "")
+                        evidence_ids = list(dict.fromkeys(re.findall(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", legal_basis)))
+                        visible_basis = format_report_evidence_refs(
+                            legal_basis, st.session_state.evidence_records
+                        ).strip()
+                        visible_basis = re.sub(r"^[\s、，,；;]+|[\s、，,；;]+$", "", visible_basis)
+                        if visible_basis:
+                            st.markdown(f"**法律/合规依据：** {visible_basis}")
+                        elif evidence_ids:
+                            st.markdown("**法律/合规依据：** 关联以下检索原文（请核对原文是否支持本项分析）")
+                        else:
+                            st.markdown("**法律/合规依据：** 未检索到直接依据")
+                        for evidence_id in evidence_ids:
+                            evidence = st.session_state.evidence_records.get(evidence_id)
+                            if evidence:
+                                citation = f"《{evidence.get('doc_name', '参考文档')}》 {evidence.get('article_no') or ''} {evidence.get('title') or ''}".strip()
+                                if st.button(f"查看依据原文：{citation}", key=f"evidence_{level}_{index}_{evidence_id}"):
+                                    show_evidence_content(evidence)
+                            else:
+                                st.warning(f"报告引用的证据 {evidence_id} 未在本次检索记录中找到。")
+                        if not evidence_ids and evidence_records:
+                            article_refs = set(re.findall(r"第\s*[零〇一二三四五六七八九十百千万两0-9]+\s*条", legal_basis))
+                            related = [
+                                evidence for evidence in evidence_records.values()
+                                if evidence.get("article_no") in article_refs
+                            ]
+                            for evidence_index, evidence in enumerate(related):
+                                citation = f"{evidence.get('doc_name', '参考文档')} {evidence.get('article_no', '')} {evidence.get('title', '')}".strip()
+                                if st.button(f"查看命中原文：{citation}", key=f"basis_{level}_{index}_{evidence_index}"):
+                                    show_evidence_content(evidence)
+                        st.markdown(f"**风险分析：** {item.get('issue', '')}")
+                        st.markdown(f"**修改建议：** {item.get('suggested_revision', '')}")
+                        if index < len(items):
+                            st.divider()
+            with st.expander("查看完整原始审查报告"):
+                st.markdown(format_report_evidence_refs(
+                    clean_report_content(st.session_state.final_report),
+                    st.session_state.evidence_records,
+                ))
+        else:
+            st.warning("报告未能解析成风险条目，以下显示完整原始报告。")
+            st.markdown(format_report_evidence_refs(
+                clean_report_content(st.session_state.final_report),
+                st.session_state.evidence_records,
+            ))
 
         st.markdown("<br>", unsafe_allow_html=True)
         export_col1, export_col2 = st.columns(2)
         export_filename = f"contract_review_{int(time.time())}"
+        readable_report = format_report_evidence_refs(
+            st.session_state.final_report, st.session_state.evidence_records
+        )
         with export_col1:
             st.download_button(
                 label="📥 导出 Markdown 报告",
-                data=st.session_state.final_report,
+                data=readable_report,
                 file_name=f"{export_filename}.md",
                 mime="text/markdown",
                 use_container_width=True,
             )
         with export_col2:
             try:
-                docx_report = report_to_docx(st.session_state.final_report)
+                docx_report = report_to_docx(readable_report)
                 st.download_button(
                     label="📄 导出 Word 报告",
                     data=docx_report,

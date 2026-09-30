@@ -46,13 +46,42 @@ def clean_report_content(raw_text: str) -> str:
 
 
 def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
-    """尽力将 JSON Final 结果解析为结构化报告；Markdown 结果返回 None。"""
+    """解析 JSON 报告，或解析系统约定格式的 Markdown 条目。"""
     content = clean_report_content(raw_text)
     if not content:
         return None
     try:
         return ContractReviewReport.model_validate(json.loads(content))
     except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    headings = list(re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", content))
+    reviews = []
+    field_patterns = {
+        "risk_level": r"风险等级",
+        "legal_basis": r"法律(?:/合规)?依据|合规依据",
+        "issue": r"风险剖析|风险说明|风险分析",
+        "suggested_revision": r"修改建议|建议修改",
+    }
+    for index, heading in enumerate(headings):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+        section = content[heading.end():end]
+        topic = re.sub(r"^\s*\d+[.、)]\s*", "", heading.group(1)).strip(" []【】")
+        values = {}
+        for field, label_pattern in field_patterns.items():
+            match = re.search(
+                rf"(?im)^\s*[-*+]?\s*(?:\*\*)?(?:{label_pattern})(?:\*\*)?\s*[:：]\s*(.+?)\s*$",
+                section,
+            )
+            if match:
+                values[field] = match.group(1).strip().strip("* ")
+        if topic and all(field in values for field in field_patterns):
+            reviews.append({"clause_topic": topic, **values})
+    if not reviews:
+        return None
+    try:
+        return ContractReviewReport.model_validate({"reviews": reviews})
+    except (TypeError, ValueError):
         return None
 
 

@@ -12,7 +12,7 @@ pip install --no-cache-dir vllm==0.6.4.post1 modelscope requests "transformers>=
 
 # pdf支持
 pip install reportlab
-pip install pip install pymupdf
+pip install pymupdf
 
 # 光学支持
 pip install rapidocr-onnxruntime pillow
@@ -45,6 +45,11 @@ pip install streamlit httpx-sse
 # 启动 API 服务时增加 --debug，可在控制台打印每轮 messages、请求参数、模型响应和工具结果：
 python gateway/api_server.py --debug
 
+# 每次审查都会清空并重写 data/review_logs/review_trace.jsonl
+# 文件包含提交的合同文本、模型每轮输出、工具调用/返回、熔断事件及最终结果。
+# 多条款并发审查共享一个批次编号，只在批次首个请求开始时清空一次。
+# 记录可能包含合同敏感信息，请勿提交或外传；data/ 已由 .gitignore 排除。
+
 # 4. 创建项目专属目录并进入
 mkdir -p ~/legal_agent_lab && cd ~/legal_agent_lab
 
@@ -63,8 +68,9 @@ streamlit run web/app_ui.py --server.port 8501
 
 # 可选运行配置
 # MAX_UPLOAD_BYTES=20971520      # 合同上传大小上限，默认 20 MiB
-# VLLM_MAX_MODEL_LEN=4096        # 模型上下文长度
-# DEFAULT_MODEL_KEY 由 configs/config.py 统一维护，启动器默认使用 qwen2.5-7b-awq
+# VLLM_MAX_MODEL_LEN=4096        # 可选：覆盖当前模型的默认上下文长度
+# DEFAULT_MODEL_NAME=qwen2.5-7b  # 默认模型；权重目录、启动别名及上下文长度由共享模型注册表自动解析
+# DEFAULT_MODEL_KEY=qwen2.5-7b-awq  # 可选：使用启动器模型键覆盖默认模型
 
 # 模块职责
 # services/doc_loader.py 仅负责多格式文档读取与文本归一化
