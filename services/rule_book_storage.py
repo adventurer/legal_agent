@@ -71,18 +71,28 @@ class RuleBookStore:
                 )"""
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_topic ON review_rules(topic)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS rule_book_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
             conn.commit()
 
     def _ensure_preset_rules(self) -> None:
         with self.connection() as conn:
-            if conn.execute("SELECT COUNT(*) FROM review_rules").fetchone()[0]:
+            seeded = conn.execute(
+                "SELECT 1 FROM rule_book_meta WHERE key = 'preset_rules_seeded'"
+            ).fetchone()
+            if seeded:
                 return
-            conn.executemany(
-                """INSERT INTO review_rules
-                   (topic, keywords, risk_level, standard_requirement,
-                    forbidden_pattern, recommended_clause)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                PRESET_RULES,
+            if not conn.execute("SELECT COUNT(*) FROM review_rules").fetchone()[0]:
+                conn.executemany(
+                    """INSERT INTO review_rules
+                       (topic, keywords, risk_level, standard_requirement,
+                        forbidden_pattern, recommended_clause)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    PRESET_RULES,
+                )
+            conn.execute(
+                "INSERT INTO rule_book_meta (key, value) VALUES ('preset_rules_seeded', 'true')"
             )
             conn.commit()
 

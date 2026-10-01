@@ -1,0 +1,103 @@
+import unittest
+
+from services.report_parser import (
+    normalize_report_structure,
+    parse_structured_report,
+    validate_report_structure,
+)
+
+
+class ReportParserTests(unittest.TestCase):
+    def test_normalizes_heading_fields_and_common_affected_party_typo(self):
+        raw_report = """# 第五条 服务保障
+
+## 5.1 质保周期
+### 风险类型: 法律合规
+### 风险等级: 低风险
+### 企业内部风险等级: 
+### 法律效力: 有直接依据
+### 商业后果: 保障设备质量
+### 救济成本: 低
+### 影响受方: 双方
+### 结论置信度: 高
+### 法律/合规依据: 民法典合同编第619条
+### 企业知识库依据: 
+### 风险剖析: 约定提供质保服务。
+### 修改建议: 明确质保期限。
+"""
+
+        normalized = normalize_report_structure(raw_report)
+
+        self.assertIsNotNone(normalized)
+        self.assertIn("### 风险等级提示", normalized)
+        self.assertIn("- **受影响方**: 双方", normalized)
+        self.assertIn("- **企业内部风险等级**: 未检索到企业内部风险等级", normalized)
+        self.assertIn(
+            "- **企业知识库依据**: 未检索到相关企业规则或知识库依据",
+            normalized,
+        )
+        self.assertNotIn("初稿未提供", normalized)
+        self.assertEqual(validate_report_structure(normalized), [])
+        parsed = parse_structured_report(normalized)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(parsed.reviews[0].affected_party, "双方")
+        self.assertEqual(
+            parsed.reviews[0].enterprise_risk_level,
+            "未检索到企业内部风险等级",
+        )
+        self.assertEqual(
+            parsed.reviews[0].enterprise_basis,
+            "未检索到相关企业规则或知识库依据",
+        )
+
+    def test_normalization_preserves_populated_enterprise_evidence_fields(self):
+        raw_report = """### 第三条 资料使用
+- **风险类型**: 商业
+- **风险等级**: 中风险
+- **企业内部风险等级**: High
+- **法律效力**: 未检索到直接依据
+- **商业后果**: 需复核企业流程
+- **救济成本**: 中
+- **受影响方**: 甲方
+- **结论置信度**: 中
+- **法律/合规依据**: 未检索到直接依据
+- **企业知识库依据**: reference_docs/policy.md · 第 4 页 [[KB:EV12]]
+- **风险剖析**: 流程要求未写入合同。
+- **修改建议**: 补充流程约定。
+"""
+
+        normalized = normalize_report_structure(raw_report)
+
+        self.assertIn("- **企业内部风险等级**: High", normalized)
+        self.assertIn(
+            "- **企业知识库依据**: reference_docs/policy.md · 第 4 页 [[KB:EV12]]",
+            normalized,
+        )
+
+    def test_normalization_applies_validated_supplement_over_no_match_defaults(self):
+        raw_report = """### 第五条 服务保障
+- **风险等级**: 中风险
+- **法律/合规依据**: 未检索到直接依据
+- **风险剖析**: 需核对服务保障流程。
+- **修改建议**: 明确服务流程。
+"""
+
+        normalized = normalize_report_structure(
+            raw_report,
+            evidence_supplements={
+                "第五条 服务保障": {
+                    "enterprise_risk_level": "High",
+                    "enterprise_basis": "data/rule_book.db · 规则 RULE3 [[RULE:RULE3]]",
+                },
+            },
+        )
+
+        self.assertIn("- **企业内部风险等级**: High", normalized)
+        self.assertIn(
+            "- **企业知识库依据**: data/rule_book.db · 规则 RULE3 [[RULE:RULE3]]",
+            normalized,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

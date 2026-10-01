@@ -6,26 +6,25 @@
 1. 暴露 RESTful 接口供 Web 前端调用
 2. 提供合同文件（Word / PDF / 图片 OCR / TXT）上传与条款切分接口
 3. 提供基于 SSE 的打字机式流式推理审查接口
-4. 核心健壮性与可观测性：
-   - 任务级端到端追踪：日志全程注入 Task ID 前缀
-   - 熔断事件透传：新增 circuit_break SSE 事件，实时向前端推送熔断详情与知识库补齐建议
-   - 纯输入 Token 95% 熔断底线：输入接近极限时自动切入模型自知识推理
-   - 全程 4096 预算，末轮解除 stop 词杜绝长文截断
+4. 保留审查轨迹记录与 ReAct 流式事件
 """
 
 import os
 import sys
 import json
-import argparse
+import asyncio
+from collections import Counter
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
 import re
 import uuid
 import uvicorn
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body, Request
+from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sse_starlette.sse import EventSourceResponse
+from urllib.parse import urlparse
 
 # 项目根目录对齐
 ROOT_DIR = Path(__file__).resolve().parent.parent
@@ -48,16 +47,11 @@ from core.agent_loop import ContractReviewAgent
 from services.doc_loader import DocumentLoader
 from gateway.session_manager import session_manager
 from gateway.upload_service import create_temp_upload_path, get_safe_extension, save_upload_file
-from gateway.review_orchestrator import (
-    CONTEXT_THRESHOLD_95,
-    MODEL_MAX_CONTEXT,
-    OUTPUT_MAX_TOKENS,
-    ReviewOrchestrator,
-    generate_kb_deficit_recommendation,
-)
+from gateway.review_orchestrator import ReviewOrchestrator
 from services.contract_rewriter import rewrite_selected_clauses
 from services.review_trace import ReviewTrace
 from gateway.model_runtime import model_runtime
+from services.pdf_kb_loader import determine_tag
 
 app = FastAPI(
     title="Legal Agent Lab API Gateway",
@@ -76,6 +70,48 @@ app.add_middleware(
 agent_instance = ContractReviewAgent()
 review_orchestrator = ReviewOrchestrator(agent_instance)
 doc_loader = DocumentLoader()
+
+KNOWLEDGE_FILE_EXTENSIONS = {".pdf", ".txt", ".md"}
+KNOWLEDGE_CATEGORY_PREFIXES = {
+    "law": "法典",
+    "enterprise": "合规",
+    "general": "通用",
+}
+
+
+def _knowledge_source_paths() -> List[Path]:
+    docs_dir = Path(agent_instance.docs_dir)
+    if not docs_dir.exists():
+        return []
+    return sorted(
+        path for path in docs_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in KNOWLEDGE_FILE_EXTENSIONS
+        and not path.name.lower().endswith(".pdf.txt")
+    )
+
+
+def _reload_knowledge_index() -> int:
+    agent_instance.tool_mapping = agent_instance.tool_registry.build()
+    knowledge_base = agent_instance.tool_registry.knowledge_base
+    return len(getattr(knowledge_base, "pages", []) or [])
+
+
+def _knowledge_rule_book():
+    rule_book = agent_instance.tool_registry.rule_book
+    if rule_book is None:
+        raise HTTPException(status_code=503, detail="自编法典服务当前不可用。")
+    return rule_book
+
+
+def _require_local_knowledge_admin(request: Request) -> None:
+    client_host = request.client.host if request.client else ""
+    origin = request.headers.get("origin")
+    origin_host = urlparse(origin).hostname if origin else None
+    if client_host not in {"127.0.0.1", "::1", "testclient"} or (
+        origin_host and origin_host not in {"localhost", "127.0.0.1", "::1"}
+    ):
+        raise HTTPException(status_code=403, detail="知识库管理接口仅允许本机访问。")
 
 
 def normalize_clauses_output(raw_clauses: Any) -> List[Dict[str, Any]]:
@@ -106,8 +142,6 @@ def normalize_clauses_output(raw_clauses: Any) -> List[Dict[str, Any]]:
 
 @app.get("/health")
 async def health_check():
-    from gateway import review_orchestrator as orchestrator_module
-
     runtime_status = model_runtime.status()
     unavailable_tools = getattr(agent_instance.tool_registry, "unavailable_tools", set())
     return {
@@ -122,8 +156,163 @@ async def health_check():
         "knowledge_base_pages": len(
             getattr(agent_instance.tool_registry.knowledge_base, "pages", []) or []
         ),
-        "context_threshold_95": orchestrator_module.CONTEXT_THRESHOLD_95,
     }
+
+
+@app.get("/api/v1/knowledge/documents")
+def list_knowledge_documents(request: Request):
+    _require_local_knowledge_admin(request)
+    knowledge_base = agent_instance.tool_registry.knowledge_base
+    pages = getattr(knowledge_base, "pages", []) or []
+    indexed_counts = Counter(page.get("doc_name") for page in pages)
+    category_by_tag = {"法": "law", "合规": "enterprise", "通用": "general"}
+    documents = []
+    for path in _knowledge_source_paths():
+        tag = determine_tag(path.name)
+        documents.append({
+            "filename": path.name,
+            "category": category_by_tag.get(tag, "general"),
+            "tag": tag,
+            "size_bytes": path.stat().st_size,
+            "indexed_segments": indexed_counts.get(path.name, 0),
+        })
+    return {"documents": documents, "indexed_pages": len(pages)}
+
+
+@app.get("/api/v1/knowledge/document-content")
+def view_knowledge_document(request: Request, filename: str):
+    _require_local_knowledge_admin(request)
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=400, detail="无效的文件名。")
+    docs_dir = Path(agent_instance.docs_dir).resolve()
+    source = docs_dir / filename
+    if (
+        not source.is_file()
+        or source.is_symlink()
+        or source.suffix.lower() not in KNOWLEDGE_FILE_EXTENSIONS
+        or source.name.lower().endswith(".pdf.txt")
+    ):
+        raise HTTPException(status_code=404, detail="未找到可查看的知识库资料。")
+
+    media_types = {
+        ".pdf": "application/pdf",
+        ".md": "text/markdown; charset=utf-8",
+        ".txt": "text/plain; charset=utf-8",
+    }
+    return FileResponse(source, media_type=media_types[source.suffix.lower()])
+
+
+@app.post("/api/v1/knowledge/documents")
+async def upload_knowledge_document(
+    request: Request,
+    file: UploadFile = File(...),
+    category: str = Form(...),
+):
+    _require_local_knowledge_admin(request)
+    if category not in KNOWLEDGE_CATEGORY_PREFIXES:
+        raise HTTPException(status_code=422, detail="未知知识库分类。")
+    raw_name = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
+    extension = Path(raw_name).suffix.lower()
+    if extension not in KNOWLEDGE_FILE_EXTENSIONS:
+        raise HTTPException(status_code=400, detail="仅支持 PDF、TXT、MD 文件。")
+    stem = re.sub(r"[^\w.-]+", "_", Path(raw_name).stem, flags=re.UNICODE).strip("._ ")
+    if not stem:
+        raise HTTPException(status_code=400, detail="文件名无有效内容。")
+
+    docs_dir = Path(agent_instance.docs_dir)
+    docs_dir.mkdir(parents=True, exist_ok=True)
+    filename = f"{KNOWLEDGE_CATEGORY_PREFIXES[category]}_{stem}{extension}"
+    destination = docs_dir / filename
+    if destination.exists():
+        raise HTTPException(status_code=409, detail="同名资料已存在，请先删除旧文件或更换文件名。")
+
+    temporary_path = docs_dir / f".kb-upload-{uuid.uuid4().hex}.tmp"
+    try:
+        await save_upload_file(file, temporary_path, MAX_UPLOAD_BYTES)
+        os.replace(temporary_path, destination)
+        indexed_pages = await asyncio.to_thread(_reload_knowledge_index)
+        return {
+            "filename": filename,
+            "indexed_pages": indexed_pages,
+            "message": "资料已加入知识库并完成索引。",
+        }
+    except HTTPException:
+        raise
+    except (OSError, RuntimeError, ValueError) as exc:
+        if destination.exists():
+            destination.unlink()
+        raise HTTPException(status_code=422, detail=f"资料索引失败：{exc}") from exc
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+@app.delete("/api/v1/knowledge/documents")
+def delete_knowledge_document(request: Request, filename: str):
+    _require_local_knowledge_admin(request)
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=400, detail="无效的文件名。")
+    docs_dir = Path(agent_instance.docs_dir).resolve()
+    source = docs_dir / filename
+    if (
+        not source.is_file()
+        or source.is_symlink()
+        or source.suffix.lower() not in KNOWLEDGE_FILE_EXTENSIONS
+        or source.name.lower().endswith(".pdf.txt")
+    ):
+        raise HTTPException(status_code=404, detail="未找到可管理的知识库资料。")
+
+    artifacts = [source.with_suffix(".articles.json")]
+    if source.suffix.lower() == ".pdf":
+        cache_path = source.with_suffix(".pdf.txt")
+        artifacts.extend([cache_path, cache_path.with_suffix(cache_path.suffix + ".meta.json")])
+    source.unlink()
+    for artifact in artifacts:
+        artifact.unlink(missing_ok=True)
+    return {"indexed_pages": _reload_knowledge_index(), "message": "资料已删除并刷新索引。"}
+
+
+@app.post("/api/v1/knowledge/reload")
+def reload_knowledge_index(request: Request):
+    _require_local_knowledge_admin(request)
+    try:
+        return {"indexed_pages": _reload_knowledge_index(), "message": "知识库索引已刷新。"}
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise HTTPException(status_code=500, detail=f"知识库索引刷新失败：{exc}") from exc
+
+
+@app.get("/api/v1/knowledge/rules")
+def list_knowledge_rules(request: Request):
+    _require_local_knowledge_admin(request)
+    return {"rules": _knowledge_rule_book().list_all_rules()}
+
+
+@app.put("/api/v1/knowledge/rules")
+def save_knowledge_rule(request: Request, payload: Dict[str, Any] = Body(...)):
+    _require_local_knowledge_admin(request)
+    required = ("topic", "keywords", "risk_level", "standard_requirement")
+    values = {name: str(payload.get(name, "")).strip() for name in required}
+    missing = [name for name, value in values.items() if not value]
+    if missing:
+        raise HTTPException(status_code=422, detail=f"必填字段缺失：{', '.join(missing)}")
+    saved = _knowledge_rule_book().upsert_rule(
+        **values,
+        forbidden_pattern=str(payload.get("forbidden_pattern", "")).strip(),
+        recommended_clause=str(payload.get("recommended_clause", "")).strip(),
+    )
+    if not saved:
+        raise HTTPException(status_code=500, detail="规则保存失败。")
+    return {"message": "规则已保存。"}
+
+
+@app.delete("/api/v1/knowledge/rules")
+def delete_knowledge_rule(request: Request, topic: str):
+    _require_local_knowledge_admin(request)
+    if not topic.strip():
+        raise HTTPException(status_code=422, detail="规则主题不能为空。")
+    deleted = _knowledge_rule_book().delete_rule_by_topic(topic)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="未找到该规则。")
+    return {"message": "规则已删除。"}
 
 
 @app.get("/api/v1/model-runtime")
@@ -243,7 +432,6 @@ async def review_contract_stream(request: ReviewRequest):
             task_label=task_label,
             review_run_id=review_run_id,
         )
-        print(f"[*] 审查调试记录: {trace.path}", flush=True)
     except OSError as exc:
         print(f"[警告] 无法创建审查调试记录: {exc}", flush=True)
         trace = None
@@ -309,16 +497,7 @@ async def rewrite_contract(request: ContractRewriteRequest):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="启动 Legal Agent FastAPI Gateway")
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="在控制台打印每轮模型请求、响应和工具交互详情",
-    )
-    args = parser.parse_args()
-    review_orchestrator.debug = args.debug
     print(f"[*] 正在启动 Legal Agent FastAPI Gateway 监听: http://{GATEWAY_HOST}:{GATEWAY_PORT}")
-    print(f"[*] 模型交互 Debug: {'开启' if args.debug else '关闭'}")
     uvicorn.run(
         app,
         host=GATEWAY_HOST,

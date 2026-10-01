@@ -4,8 +4,8 @@
 文件名: web/app_ui.py
 职责:
 1. 基于 Streamlit 构建全宽工业级法务合同审查专业工作台
-2. 捕获后端 circuit_break 事件，在前端可视化展示具体的熔断原因与知识库增补推荐
-3. 支持 1-100 路多线程并发审查 (Map-Reduce 架构)，各条款状态独立追踪
+2. 展示 ReAct 流式输出与工具调用结果
+3. 支持多线程并发审查，各条款状态独立追踪
 """
 
 import sys
@@ -18,21 +18,30 @@ import hashlib
 import json
 import re
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import List, Dict, Any, Optional
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from queue import Empty, Queue
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
 import streamlit as st
 import httpx
-from services.report_parser import clean_report_content, parse_structured_report
+from core.prompts import RISK_LEVEL_REPORT_LEGEND
+from services.report_parser import (
+    clean_report_content,
+    normalize_report_structure,
+    parse_structured_report,
+)
+from services.review_execution import (
+    execute_review_unit,
+)
 from web.api_client import check_gateway_health as fetch_gateway_health
 from web.api_client import upload_contract_file as send_contract_file
 from web.contract_client import rewrite_contract
 from web.report_exporter import report_to_docx
-from web.sse_client import stream_contract_review
 
 API_BASE_URL = "http://127.0.0.1:9000"
 GATEWAY_SCRIPT = ROOT_DIR / "gateway" / "api_server.py"
@@ -49,8 +58,10 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-    header[data-testid="stHeader"] { display: none !important; }
     [data-testid="stSidebar"] { display: none !important; }
+    @media (max-width: 768px) {
+        [data-testid="stSidebar"] { display: block !important; }
+    }
     .block-container {
         padding-top: 2rem !important;
         padding-bottom: 3rem !important;
@@ -137,20 +148,14 @@ if "structured_report" not in st.session_state:
     st.session_state.structured_report = None
 if "evidence_records" not in st.session_state:
     st.session_state.evidence_records = {}
-if "consistency_checks" not in st.session_state:
-    st.session_state.consistency_checks = []
 if "is_reviewing" not in st.session_state:
     st.session_state.is_reviewing = False
-if "truncation_warning" not in st.session_state:
-    st.session_state.truncation_warning = None
-if "latest_meta" not in st.session_state:
-    st.session_state.latest_meta = None
-if "circuit_breaks" not in st.session_state:
-    st.session_state.circuit_breaks = []  # 存储各任务熔断详情
 if "revised_contract" not in st.session_state:
     st.session_state.revised_contract = None
 if "revised_contract_signature" not in st.session_state:
     st.session_state.revised_contract_signature = None
+if "review_flow" not in st.session_state:
+    st.session_state.review_flow = None
 
 
 # ==================== 3. 辅助函数 ====================
@@ -255,22 +260,78 @@ def render_thought_box(text: str) -> str:
     """
 
 
-def render_reasoning_text(text: str) -> str:
-    """将模型推理流转为纯文本，避免 Markdown 语法直接出现在思考区。"""
+def clean_reasoning_text(text: str) -> str:
+    """将模型文本中的 Markdown 标记移除，供纯文本过程框显示。"""
     visible_text = text or ""
-    final_markers = ("Final:", "【最终结论】", "最终审查意见", "综合审查报告")
-    marker_positions = [visible_text.find(marker) for marker in final_markers if visible_text.find(marker) >= 0]
-    if marker_positions:
-        visible_text = visible_text[:min(marker_positions)]
-
     visible_text = re.sub(r"(?im)^\s*```(?:markdown|md)?\s*$", "", visible_text)
     visible_text = re.sub(r"(?im)^\s*```\s*$", "", visible_text)
     visible_text = re.sub(r"^\s{0,3}#{1,6}\s*", "", visible_text, flags=re.MULTILINE)
     visible_text = re.sub(r"^\s*[-*+]\s+", "• ", visible_text, flags=re.MULTILINE)
     visible_text = re.sub(r"(\*\*|__|`)", "", visible_text)
     visible_text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", visible_text)
-    visible_text = visible_text.strip()
-    return render_thought_box(visible_text or "模型正在整理最终审查报告...")
+    return visible_text.strip()
+
+
+def render_reasoning_text(text: str) -> str:
+    """将模型文本显示为纯文本，避免 Markdown 语法直接出现在过程框。"""
+    return render_thought_box(
+        clean_reasoning_text(text) or "等待模型交互事件..."
+    )
+
+
+def report_text_for_display(text: str) -> str:
+    """Hide the report legend from UI views while retaining it in stored reports."""
+    content = clean_report_content(text)
+    if content.startswith(RISK_LEVEL_REPORT_LEGEND):
+        return content[len(RISK_LEVEL_REPORT_LEGEND):].lstrip()
+    return content
+
+
+def render_model_output_box(
+    events: List[str], model_text: str, model_report: str
+) -> str:
+    sections = []
+    if events:
+        sections.append("审查进度：\n" + "\n".join(events))
+    if model_text:
+        sections.append("模型交互：\n" + clean_reasoning_text(model_text))
+    if model_report:
+        sections.append("报告生成中：\n" + model_report)
+    return render_thought_box("\n\n".join(sections) or "等待审查进度...")
+
+
+def render_saved_review_flow() -> None:
+    flow = st.session_state.get("review_flow")
+    if not flow:
+        return
+
+    st.markdown(f"##### 审查进度 · {flow.get('status', '审查中')}")
+    if flow.get("mode") == "stream":
+        st.markdown(f"**审查对象：{flow.get('title', '合同正文')}**")
+        st.markdown(
+            render_model_output_box(
+                flow.get("events", []),
+                flow.get("thought", ""),
+                flow.get("model_report", ""),
+            ),
+            unsafe_allow_html=True,
+        )
+        if flow.get("report"):
+            st.markdown(report_text_for_display(flow["report"]))
+        return
+
+    for clause in flow.get("clauses", {}).values():
+        st.markdown(f"**{clause.get('status', '审查中')}：{clause.get('title', '')}**")
+        st.markdown(
+            render_model_output_box(
+                clause.get("flow", []),
+                clause.get("thought", ""),
+                clause.get("model_report", clause.get("report", "")),
+            ),
+            unsafe_allow_html=True,
+        )
+        if clause.get("final_report"):
+            st.markdown(report_text_for_display(clause["final_report"]))
 
 
 @st.dialog("条款内容")
@@ -304,20 +365,18 @@ def show_evidence_content(evidence: Dict[str, Any]) -> None:
     article = evidence.get("article_no") or "文档片段"
     title = evidence.get("title")
     st.markdown(f"#### {evidence.get('doc_name', '参考文档')} · {article}{f' {title}' if title else ''}")
-    st.caption(f"来源页码：{evidence.get('page_start', '?')}" + (f"–{evidence['page_end']}" if evidence.get("page_end") != evidence.get("page_start") else ""))
+    if evidence.get("source_location"):
+        st.caption(f"知识库位置：{evidence['source_location']}")
+    elif evidence.get("source_path"):
+        st.caption(f"知识库位置：{evidence['source_path']}")
+    if evidence.get("source_type") == "enterprise_rule":
+        internal_grade = evidence.get("enterprise_risk_level")
+        grade_label = f" · 企业内部风险等级：{internal_grade}" if internal_grade else ""
+        st.caption(f"来源类型：企业自编规则（内部审查偏好，不是法律依据）{grade_label}")
+    else:
+        if not evidence.get("source_location"):
+            st.caption(f"来源页码：{evidence.get('page_start', '?')}" + (f"–{evidence['page_end']}" if evidence.get("page_end") != evidence.get("page_start") else ""))
     st.text_area("命中条款原文（文本提取）", value=evidence.get("text", ""), height=420, disabled=True)
-
-
-def collect_evidence(observation: str, destination: Optional[Dict[str, Any]] = None) -> None:
-    """Read evidence records from the JSON returned by a knowledge search tool."""
-    target = destination if destination is not None else st.session_state.evidence_records
-    try:
-        payload = json.loads(observation)
-    except (json.JSONDecodeError, TypeError):
-        return
-    for evidence in payload.get("evidence", []):
-        if evidence.get("id"):
-            target[evidence["id"]] = evidence
 
 
 def format_report_evidence_refs(
@@ -332,7 +391,7 @@ def format_report_evidence_refs(
     }
 
     def replace_reference(match: re.Match) -> str:
-        evidence = records.get(match.group(1), {})
+        evidence = records.get(match.group(1) or match.group(2) or match.group(3), {})
         raw_name = str(evidence.get("doc_name", "")).strip()
         if not raw_name:
             return ""
@@ -340,16 +399,27 @@ def format_report_evidence_refs(
         if stem.lower().endswith(".pdf"):
             stem = Path(stem).stem
         title = document_titles.get(stem.lower(), stem or "检索依据")
+        citation = f"《{title}》"
+        if evidence.get("title") and evidence.get("source_type") == "enterprise_rule":
+            citation += f" · {evidence['title']}"
+        if evidence.get("source_location"):
+            return f"{citation}（{evidence['source_location']}）"
+        if evidence.get("source_path"):
+            citation += f"（{evidence['source_path']}）"
         page_start = evidence.get("page_start")
         page_end = evidence.get("page_end", page_start)
         if page_start is None:
-            return f"《{title}》"
+            return citation
         page_label = f"第 {page_start} 页"
         if page_end is not None and page_end != page_start:
             page_label += f"–{page_end} 页"
-        return f"《{title}》（{page_label}）"
+        return f"{citation}（{page_label}）"
 
-    return re.sub(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", replace_reference, report or "")
+    reference_pattern = (
+        r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]|"
+        r"\[\[RULE:(RULE\d+)\]\]|\[\[KB:(EV[A-Za-z0-9]+)\]\]"
+    )
+    return re.sub(reference_pattern, replace_reference, report or "")
 
 
 # ==================== 4. 顶部控制栏 ====================
@@ -481,7 +551,7 @@ with st.expander("🛠️ 服务管理", expanded=health.get("status") != "healt
         else:
             st.warning("请先在网关服务页启动网关，待其运行后即可选择模型。")
 
-with st.container():
+with nullcontext():
     st.markdown('<div class="top-control-panel">', unsafe_allow_html=True)
     ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4, ctrl_col5 = st.columns(
         [1.5, 1.1, 0.9, 1.0, 0.9], gap="medium"
@@ -512,12 +582,12 @@ with st.container():
         review_side = st.selectbox(
             "审查立场",
             ["neutral", "buyer", "seller"],
-            format_func=lambda side: {"neutral": "中立", "buyer": "买方", "seller": "卖方"}[side],
+            format_func=lambda side: {"neutral": "中立", "buyer": "甲方", "seller": "乙方"}[side],
         )
 
     with ctrl_col5:
         st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
-        if st.button("📋 载入买卖样例", use_container_width=True):
+        if st.button("📋 载入甲乙方样例", use_container_width=True):
             sample_clauses = [
                 {"index": 1, "type": "preamble", "title": "合同前言与标题", "content": "高端智能制造设备采购与长期技术维保协议"},
                 {"index": 2, "type": "article", "title": "第一条 交付期限与违约金", "content": "乙方逾期交付的，每日应按合同总金额的 5% 向甲方支付惩罚性违约金。"},
@@ -530,14 +600,14 @@ with st.container():
             st.session_state.evidence_records = {}
             st.session_state.revised_contract = None
             st.session_state.revised_contract_signature = None
-            st.session_state.circuit_breaks = []
+            st.session_state.review_flow = None
             st.rerun()
 
     st.markdown('</div>', unsafe_allow_html=True)
 
 
 # ==================== 5. 中部工作区 ====================
-with st.container():
+with nullcontext():
     st.markdown("#### 📄 待审查合同数据源")
     top_col1, top_col2 = st.columns([1, 2], gap="medium")
     with top_col1:
@@ -565,7 +635,7 @@ with st.container():
                     st.session_state.evidence_records = {}
                     st.session_state.revised_contract = None
                     st.session_state.revised_contract_signature = None
-                    st.session_state.circuit_breaks = []
+                    st.session_state.review_flow = None
                     st.success(f"解析成功，切分出 {len(data['clauses'])} 个条款单元！")
                     st.rerun()
 
@@ -686,192 +756,243 @@ def execute_stream_review(
 ) -> Optional[str]:
     st.session_state.is_reviewing = True
     st.session_state.structured_report = None
-    st.session_state.circuit_breaks = []
+    saved_flow = {
+        "mode": "stream",
+        "title": target_name,
+        "status": "审查中",
+        "thought": "",
+        "report": "",
+        "model_report": "",
+        "events": [],
+    }
+    st.session_state.review_flow = saved_flow
 
-    status_box = st.status(f"正在初始化 ReAct 推理链路 ({target_name})...", expanded=True)
-    meta_container = st.empty()
-    cb_container = st.empty()
-    st.caption(f"⚡ 智能体审查思考与工具调度流 [{target_name}]:")
-    thought_container = st.empty()
-    thought_container.markdown(render_thought_box(""), unsafe_allow_html=True)
-
+    flow_entries = []
     accumulated_tokens = ""
-    extracted_final = ""
-    consistency_status_recorded = False
+    accumulated_report = ""
+
+    with nullcontext():
+        status_label = st.empty()
+        status_label.markdown(f"**正在初始化 ReAct 推理链路 ({target_name})...**")
+
+    report_container = st.empty()
+    st.caption(f"审查进度 [{target_name}]")
+    thought_container = st.empty()
+
+    def refresh_thought_box() -> None:
+        thought_container.markdown(
+            render_model_output_box(
+                flow_entries,
+                accumulated_tokens,
+                accumulated_report,
+            ),
+            unsafe_allow_html=True,
+        )
+
+    def append_flow(entry: str) -> None:
+        flow_entries.append(entry)
+        saved_flow["events"] = flow_entries.copy()
+        refresh_thought_box()
+
+    refresh_thought_box()
     review_run_id = review_run_id or uuid.uuid4().hex
 
-    try:
-        for sse in stream_contract_review(
-            API_BASE_URL,
-            text_to_review,
-            max_turns,
-            review_run_id=review_run_id,
-            review_side=review_side,
-        ):
-            event = sse["event"]
-            data = sse["data"]
-
-            if event == "start":
-                status_box.update(label=f"[{data.get('task_id', target_name)}] 正在制定审查策略...")
-                if data.get("trace_id"):
-                    status_box.write(f"🧾 调试记录 ID：`{data['trace_id']}`（项目目录下的 data/review_logs/review_trace.jsonl）")
-            elif event == "token":
-                accumulated_tokens += data.get("token", "")
-                thought_container.markdown(
-                    render_reasoning_text(accumulated_tokens),
-                    unsafe_allow_html=True,
-                )
-            elif event == "tool_start":
-                status_box.write(f"🔧 **调度工具** `{data.get('tool')}`: 检索 *'{data.get('query')}'*")
-            elif event == "tool_result":
-                collect_evidence(data.get("observation", ""))
-                status_box.write("📖 **已检索依据并注入模型工作记忆**")
-            elif event == "validation_start":
-                status_box.write("🔎 正在逐项核对原文子条款、合同事实与检索依据…")
-            elif event == "validation_complete":
-                status_box.write(f"✅ {data.get('message', '最终一致性检查完成')}")
-                st.session_state.consistency_checks.append({"status": "passed", "message": data.get("message", "最终一致性检查完成")})
-                consistency_status_recorded = True
-            elif event == "validation_failed":
-                status_box.write(f"⚠️ {data.get('message', '最终一致性检查未完成，保留初稿')}")
-                st.session_state.consistency_checks.append({"status": "failed", "message": data.get("message", "最终一致性检查未完成，保留初稿")})
-                consistency_status_recorded = True
-            elif event == "circuit_break":
-                st.session_state.circuit_breaks.append(data)
-                recs_markdown = "\n".join([f"- **{r}**" for r in data.get("recommendations", [])])
-                cb_container.markdown(f"""
-                        <div class="circuit-break-card">
-                            <strong>⚠️ 触发熔断保护，切入大模型知识推理</strong><br>
-                            • <strong>任务</strong>: {data.get('task_id')}<br>
-                            • <strong>归因</strong>: {data.get('reason_type')} ({data.get('detail')})<br>
-                            • <strong>建议向知识库补充的内容</strong>:<br>
-                            {recs_markdown}
-                        </div>
-                        """, unsafe_allow_html=True)
-            elif event == "generation_meta":
-                st.session_state.latest_meta = data
-                meta_container.markdown(
-                    f"<span class='meta-badge'>任务: {data.get('task_id')}</span>"
-                    f"<span class='meta-badge'>轮次: {data.get('turn')}</span>"
-                    f"<span class='meta-badge'>输入: {data.get('prompt_chars')} 字 (~{data.get('est_prompt_tokens')} Tks)</span>"
-                    f"<span class='meta-badge'>输出: {data.get('output_chars')} 字 ({data.get('generated_tokens')} Tks)</span>",
-                    unsafe_allow_html=True,
-                )
-            elif event == "error":
-                status_box.update(
-                    label=f"❌ 审查失败：{data.get('error', '网关返回错误')}",
-                    state="error",
-                    expanded=True,
-                )
-                st.session_state.is_reviewing = False
-                return None
-            elif event == "final_report":
-                if not data.get("is_complete", data.get("status") == "success"):
-                    status_box.update(
-                        label="⚠️ 审查未完整完成，结果未保存",
-                        state="error",
-                        expanded=True,
+    def handle_event(event: str, data: Dict[str, Any]) -> None:
+        nonlocal accumulated_tokens, accumulated_report
+        if event == "start":
+            status_label.markdown(f"**[{data.get('task_id', target_name)}] 正在制定审查策略...**")
+        elif event == "token":
+            accumulated_tokens += data.get("token", "")
+            saved_flow["thought"] = accumulated_tokens
+            refresh_thought_box()
+        elif event == "report_token":
+            accumulated_report += data.get("token", "")
+            saved_flow["model_report"] = accumulated_report
+            refresh_thought_box()
+        elif event == "tool_start":
+            query = data.get("query")
+            append_flow(
+                f"调度工具：{data.get('tool')}"
+                + (f"；检索词：{query}" if query else "")
+            )
+        elif event == "tool_result":
+            if data.get("success"):
+                sources = data.get("evidence_sources", [])
+                source_text = "；命中来源：" + "；".join(
+                    f"{item.get('source_location', '来源位置未提供')} [{item.get('evidence_id')}]"
+                    for item in sources
+                ) if sources else "；未命中知识库来源"
+                risk_ids = data.get("risk_evidence_ids", [])
+                risk_levels = data.get("enterprise_risk_levels", {})
+                risk_route_text = (
+                    "；触发企业风险等级处置路径："
+                    + ", ".join(
+                        f"{evidence_id}（{risk_levels.get(evidence_id, '等级未提供')}）"
+                        for evidence_id in risk_ids
                     )
-                    st.session_state.is_reviewing = False
-                    return None
-                extracted_final = data.get("raw_report", "")
-                st.session_state.structured_report = data.get("structured_report")
-                if not data.get("consistency_checked") and not consistency_status_recorded:
-                    st.session_state.consistency_checks.append({
-                        "status": "failed",
-                        "message": data.get("consistency_message", "该报告未完成最终一致性检查"),
-                    })
-                status_box.update(
-                    label="✅ 审查完成！",
-                    state="complete",
-                    expanded=False,
+                    if risk_ids else ""
                 )
-            elif event == "done":
-                break
+                append_flow(
+                    f"工具结果：已注入模型工作记忆（带出 {data.get('injected_chars', 0)} 字符）"
+                    f"{source_text}{risk_route_text}"
+                )
+            else:
+                append_flow(
+                    f"工具调用失败，错误已交回模型修正：{data.get('error', '')}"
+                )
+        elif event == "pipeline_stage":
+            if data.get("stage") == "tool_recording":
+                return
+            message = data.get("message") or ""
+            if data.get("stage") == "review_complete":
+                message = "报告复核完成"
+            if message:
+                append_flow(message)
+        elif event == "guardrail":
+            for finding in data.get("findings", []):
+                append_flow(
+                    f"程序规则提示（需核实）：{finding.get('message')} "
+                    f"证据片段：{finding.get('evidence')}"
+                )
+        elif event == "model_start":
+            message = f"正在分析第 {data.get('turn')} 轮..."
+            status_label.markdown(f"**{message}**")
+        elif event == "error":
+            error_text = f"审查失败：{data.get('error', '网关返回错误')}"
+            status_label.markdown(f"**{error_text}**")
+            append_flow(error_text)
+        elif event == "final_report":
+            status_label.markdown(
+                "**正在校验最终审查报告...**"
+                if data.get("is_complete")
+                else "**审查未完整完成，结果未保存**"
+            )
 
-        if not extracted_final:
-            status_box.update(label="⚠️ 未收到完整审查报告", state="error", expanded=True)
-            st.session_state.is_reviewing = False
-            return None
+    result = execute_review_unit(
+        API_BASE_URL,
+        text_to_review,
+        max_turns,
+        review_run_id,
+        review_side,
+        on_event=handle_event,
+    )
+    st.session_state.evidence_records.update(result["evidence_records"])
+    accumulated_tokens = result["model_text"]
+    accumulated_report = result["model_report"]
+    saved_flow["thought"] = accumulated_tokens
+    saved_flow["model_report"] = accumulated_report
+    refresh_thought_box()
 
-        st.session_state.is_reviewing = False
-        return clean_report_content(extracted_final or accumulated_tokens)
-    except Exception as e:
-        st.error(f"连接推理网关异常: {e}")
+    if not result["success"]:
+        saved_flow["status"] = "审查失败"
+        status_label.markdown(f"**审查失败：{result['error']}**")
+        if not any(result["error"] in entry for entry in flow_entries):
+            append_flow(f"审查失败：{result['error']}")
         st.session_state.is_reviewing = False
         return None
+
+    formatted_report = result["report"]
+    saved_flow["report"] = formatted_report
+    report_container.markdown(report_text_for_display(formatted_report))
+    parsed_report = parse_structured_report(formatted_report)
+    st.session_state.structured_report = (
+        parsed_report.model_dump(mode="json") if parsed_report else None
+    )
+    saved_flow["status"] = "审查完成"
+    status_label.markdown("**审查完成！**")
+    append_flow("审查完成")
+    st.session_state.is_reviewing = False
+    return formatted_report
 
 
 # ==================== 7. 多线程并发调度器 ====================
 def _worker_clause_review(
-    clause: Dict[str, Any], turns: int, review_run_id: str, review_side: str
+    clause: Dict[str, Any], turns: int, review_run_id: str, review_side: str,
+    event_queue: Queue,
 ) -> Dict[str, Any]:
     clause_text = clause_review_text(clause)
-    accumulated_tokens = ""
-    extracted_final = ""
-    final_complete = False
     logs = []
-    evidence_records: Dict[str, Any] = {}
-    consistency_checks = []
-    circuit_break_info = None
+    clause_index = clause.get("index", 0)
 
-    try:
-        for sse in stream_contract_review(
-            API_BASE_URL,
-            clause_text,
-            turns,
-            review_run_id=review_run_id,
-            review_side=review_side,
-        ):
-            event = sse["event"]
-            data = sse["data"]
-            if event == "start" and data.get("trace_id"):
-                logs.append(f"调试记录 ID: {data['trace_id']}")
-            elif event == "token":
-                accumulated_tokens += data.get("token", "")
-            elif event == "duplicate_action_reused":
-                logs.append(data.get("message", "检测到重复检索，已复用原结果"))
-            elif event == "circuit_break":
-                circuit_break_info = data
-                logs.append(f"⚠️ 触发熔断: {data.get('reason_type')}")
-            elif event == "tool_start":
-                logs.append(f"检索: {data.get('query')}")
-            elif event == "tool_result":
-                collect_evidence(data.get("observation", ""), evidence_records)
-            elif event == "validation_complete":
-                logs.append(data.get("message", "最终一致性检查完成"))
-                consistency_checks.append({"status": "passed", "message": data.get("message", "最终一致性检查完成")})
-            elif event == "validation_failed":
-                logs.append(data.get("message", "最终一致性检查未完成"))
-                consistency_checks.append({"status": "failed", "message": data.get("message", "最终一致性检查未完成")})
-            elif event == "final_report":
-                extracted_final = data.get("raw_report", "")
-                final_complete = data.get("is_complete", data.get("status") == "success")
-                if not data.get("consistency_checked") and not consistency_checks:
-                    consistency_checks.append({
-                        "status": "failed",
-                        "message": data.get("consistency_message", "该报告未完成一致性检查"),
-                    })
-            elif event == "error":
-                raise RuntimeError(data.get("error", "网关返回错误"))
-            elif event == "done":
-                break
+    def publish(kind: str, message: str) -> None:
+        event_queue.put((clause_index, kind, message))
 
-        if not extracted_final or not final_complete:
-            raise RuntimeError("未收到完整的最终审查报告")
-        report_content = clean_report_content(extracted_final)
-        return {
-            "index": clause.get("index", 0),
-            "title": clause.get("title", ""),
-            "report": report_content,
-            "logs": logs,
-            "circuit_break": circuit_break_info,
-            "evidence_records": evidence_records,
-            "consistency_checks": consistency_checks,
-            "success": bool(report_content),
-        }
-    except Exception as e:
-        return {"index": clause.get("index", 0), "title": clause.get("title", ""), "report": f"审查异常: {e}", "logs": [str(e)], "circuit_break": None, "evidence_records": evidence_records, "consistency_checks": consistency_checks, "success": False}
+    def handle_event(event: str, data: Dict[str, Any]) -> None:
+        if event == "start":
+            publish("status", "正在制定审查策略")
+        elif event == "token":
+            publish("thought", data.get("token", ""))
+        elif event == "report_token":
+            publish("report", data.get("token", ""))
+        elif event == "tool_start":
+            message = (
+                f"检索: {data.get('query')}" if data.get("query")
+                else f"调用工具: {data.get('tool')}"
+            )
+            logs.append(message)
+            publish("log", message)
+        elif event == "tool_result":
+            sources = data.get("evidence_sources", [])
+            source_text = "；命中来源：" + "；".join(
+                f"{item.get('source_location', '来源位置未提供')} [{item.get('evidence_id')}]"
+                for item in sources
+            ) if sources else "；未命中知识库来源"
+            risk_ids = data.get("risk_evidence_ids", [])
+            risk_levels = data.get("enterprise_risk_levels", {})
+            risk_route_text = (
+                "；触发企业风险等级处置路径："
+                + ", ".join(
+                    f"{evidence_id}（{risk_levels.get(evidence_id, '等级未提供')}）"
+                    for evidence_id in risk_ids
+                )
+                if risk_ids else ""
+            )
+            message = (
+                f"工具完成: {data.get('tool')}；带出 {data.get('injected_chars', 0)} 字符"
+                f"{source_text}{risk_route_text}"
+                if data.get("success")
+                else f"工具失败并已回传模型: {data.get('error', '')}"
+            )
+            logs.append(message)
+            publish("log", message)
+        elif event == "pipeline_stage":
+            if data.get("stage") == "tool_recording":
+                return
+            message = data.get("message") or ""
+            if data.get("stage") == "review_complete":
+                message = "报告复核完成"
+            if message:
+                logs.append(message)
+                publish("log", message)
+        elif event == "guardrail":
+            for finding in data.get("findings", []):
+                message = f"规则提示: {finding.get('message')}"
+                logs.append(message)
+                publish("log", message)
+        elif event == "model_start":
+            publish("status", f"正在分析第 {data.get('turn')} 轮")
+        elif event == "error":
+            message = data.get("error", "网关返回错误")
+            logs.append(message)
+            publish("error", message)
+
+    result = execute_review_unit(
+        API_BASE_URL,
+        clause_text,
+        turns,
+        review_run_id,
+        review_side,
+        on_event=handle_event,
+    )
+    if not result["success"] and result["error"] not in logs:
+        logs.append(result["error"])
+        publish("error", result["error"])
+    return {
+        **result,
+        "index": clause_index,
+        "title": clause.get("title", ""),
+        "logs": logs,
+    }
 
 
 def execute_concurrent_clause_review(
@@ -881,9 +1002,7 @@ def execute_concurrent_clause_review(
 ) -> str:
     st.session_state.is_reviewing = True
     st.session_state.structured_report = None
-    st.session_state.circuit_breaks = []
     st.session_state.evidence_records = {}
-    st.session_state.consistency_checks = []
     review_run_id = review_run_id or uuid.uuid4().hex
     total_count = len(clauses_to_review)
 
@@ -891,64 +1010,172 @@ def execute_concurrent_clause_review(
     progress_bar = st.progress(0, text=f"准备调度并发任务 (0/{total_count})...")
 
     status_placeholders = {}
+    thought_placeholders = {}
+    report_placeholders = {}
+    live_state = {}
     display_cols_count = min(4, max(2, min(total_count, max_workers)))
     st_cols = st.columns(display_cols_count, gap="small")
     for i, c in enumerate(clauses_to_review):
         col_target = st_cols[i % display_cols_count]
         with col_target:
-            status_placeholders[c["index"]] = st.status(f"⏳ 排队中: {c['title']}", expanded=False)
+            clause_index = c["index"]
+            status_placeholders[clause_index] = st.empty()
+            status_placeholders[clause_index].markdown(f"**排队中: {c['title']}**")
+            thought_placeholders[clause_index] = st.empty()
+            thought_placeholders[clause_index].markdown(
+                render_reasoning_text(""), unsafe_allow_html=True
+            )
+            report_placeholders[clause_index] = st.empty()
+            live_state[clause_index] = {
+                "title": c.get("title", ""),
+                "status": "排队中",
+                "thought": "",
+                "model_report": "",
+                "report": "",
+                "final_report": "",
+                "flow": [],
+            }
 
     results = []
     completed_count = 0
+    event_queue = Queue()
+    st.session_state.review_flow = {
+        "mode": "parallel",
+        "status": "并发审查中",
+        "clauses": live_state,
+    }
+
+    def render_queued_events() -> None:
+        changed_thoughts = set()
+        changed_reports = set()
+        changed_flows = set()
+        while True:
+            try:
+                clause_index, kind, message = event_queue.get_nowait()
+            except Empty:
+                break
+            state = live_state.get(clause_index)
+            if state is None:
+                continue
+            if kind == "thought":
+                state["thought"] += message
+                changed_thoughts.add(clause_index)
+            elif kind == "report":
+                state["model_report"] += message
+                changed_reports.add(clause_index)
+            elif kind in {"log", "error"}:
+                state["flow"].append(message)
+                changed_flows.add(clause_index)
+                if kind == "error":
+                    state["status"] = "审查失败"
+                    status_placeholders[clause_index].markdown(
+                        f"**审查失败: {message}**"
+                    )
+            elif kind == "status":
+                state["status"] = message
+                status_placeholders[clause_index].markdown(f"**{message}**")
+        for clause_index in changed_thoughts:
+            thought_placeholders[clause_index].markdown(
+                render_reasoning_text(live_state[clause_index]["thought"]),
+                unsafe_allow_html=True,
+            )
+        for clause_index in changed_thoughts | changed_reports | changed_flows:
+            state = live_state[clause_index]
+            thought_placeholders[clause_index].markdown(
+                render_model_output_box(
+                    state["flow"], state["thought"], state["report"]
+                ),
+                unsafe_allow_html=True,
+            )
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(_worker_clause_review, c, max_turns, review_run_id, review_side): c["index"]
+            executor.submit(
+                _worker_clause_review,
+                c,
+                max_turns,
+                review_run_id,
+                review_side,
+                event_queue,
+            ): c["index"]
             for c in clauses_to_review
         }
-        for future in as_completed(future_map):
-            c_idx = future_map[future]
-            res = future.result()
-            results.append(res)
-            completed_count += 1
+        pending = set(future_map)
+        while pending:
+            render_queued_events()
+            completed, pending = wait(
+                pending,
+                timeout=0.1,
+                return_when=FIRST_COMPLETED,
+            )
+            for future in completed:
+                c_idx = future_map[future]
+                res = future.result()
+                results.append(res)
+                completed_count += 1
 
-            if res.get("circuit_break"):
-                st.session_state.circuit_breaks.append(res["circuit_break"])
-            st.session_state.evidence_records.update(res.get("evidence_records", {}))
-            st.session_state.consistency_checks.extend(res.get("consistency_checks", []))
+                st.session_state.evidence_records.update(res.get("evidence_records", {}))
+                live_state[c_idx]["thought"] = res.get("model_text", "")
+                live_state[c_idx]["model_report"] = res.get("model_report", "")
+                live_state[c_idx]["report"] = res.get("report", "")
+                live_state[c_idx]["final_report"] = res.get("report", "")
+                live_state[c_idx]["status"] = (
+                    "审查完成" if res["success"] else "审查失败"
+                )
+                status_placeholders[c_idx].markdown(
+                    f"**{'审查完成' if res['success'] else '审查失败'}: {res['title']}**"
+                )
+                thought_placeholders[c_idx].markdown(
+                    render_model_output_box(
+                        live_state[c_idx]["flow"],
+                        live_state[c_idx]["thought"],
+                        live_state[c_idx]["model_report"],
+                    ),
+                    unsafe_allow_html=True,
+                )
+                report_placeholders[c_idx].markdown(
+                    report_text_for_display(live_state[c_idx]["final_report"])
+                    if live_state[c_idx]["final_report"]
+                    else "审查完成，报告正在整理..."
+                )
+                progress_bar.progress(
+                    completed_count / total_count,
+                    text=f"并发审查进度 ({completed_count}/{total_count})...",
+                )
 
-            card = status_placeholders.get(c_idx)
-            if card:
-                if res["success"]:
-                    card.update(
-                        label=f"✅ 完成: {res['title']}",
-                        state="complete",
-                        expanded=False,
-                    )
-                    for l in res["logs"][-3:]:
-                        card.write(f"- {l}")
-                else:
-                    card.update(label=f"❌ 失败: {res['title']}", state="error", expanded=True)
-
-            progress_bar.progress(completed_count / total_count, text=f"并发审查进度 ({completed_count}/{total_count})...")
+        render_queued_events()
 
     progress_bar.empty()
+    success_count = sum(result["success"] for result in results)
+    if results and success_count == len(results):
+        overall_status = "并发审查完成"
+    elif success_count:
+        overall_status = "并发审查部分完成"
+    else:
+        overall_status = "并发审查失败"
+    st.session_state.review_flow["status"] = overall_status
     results.sort(key=lambda x: x["index"])
-    aggregated_reports = [f"### 条款 {r['index']}: {r['title']}\n\n{r['report']}\n\n---" for r in results]
+    aggregated_reports = [
+        (
+            f"### 条款 {result['index']}: {result['title']}\n\n"
+            f"{result['report'] if result['success'] else '审查失败，未生成有效报告：' + result['error']}\n\n---"
+        )
+        for result in results
+    ]
 
     st.session_state.is_reviewing = False
-    return "# 综合合同审查终审报告 (多路并发精审汇总)\n\n" + "\n\n".join(aggregated_reports)
+    return f"# 综合合同审查终审报告（{overall_status}）\n\n" + "\n\n".join(aggregated_reports)
 
 
 # ==================== 8. 下部：审查轨迹与展示 ====================
-with st.container():
+with nullcontext():
     st.markdown("#### 🔍 审查推理轨迹与法务终审报告")
+    render_saved_review_flow()
 
     if selected_clause_idx is not None:
         target_clause = next((c for c in st.session_state.clauses if c.get("index") == selected_clause_idx), None)
         if target_clause:
             st.session_state.evidence_records = {}
-            st.session_state.consistency_checks = []
             target_text = clause_review_text(target_clause)
             report = execute_stream_review(
                 target_text,
@@ -961,7 +1188,6 @@ with st.container():
 
     elif start_full_review:
         st.session_state.evidence_records = {}
-        st.session_state.consistency_checks = []
         review_run_id = uuid.uuid4().hex
         if not st.session_state.full_contract_text.strip():
             st.warning("请先上传合同文件或载入样例数据！")
@@ -997,44 +1223,42 @@ with st.container():
             )
             st.rerun()
 
-    # 渲染前端收集到的所有熔断告警与知识库增补清单
-    if st.session_state.circuit_breaks:
-        with st.expander(f"⚠️ 审查过程中触发了 {len(st.session_state.circuit_breaks)} 处熔断保护 (点击查看知识库增补建议)", expanded=True):
-            for cb in st.session_state.circuit_breaks:
-                recs_md = "\n".join([f"- **{r}**" for r in cb.get("recommendations", [])])
-                st.markdown(f"""
-                <div class="circuit-break-card">
-                    <strong>📌 任务单元: {cb.get('task_id')}</strong><br>
-                    • <strong>熔断归因</strong>: {cb.get('reason_type')}<br>
-                    • <strong>触发详情</strong>: {cb.get('detail')}<br>
-                    • <strong>尝试过的检索词</strong>: <code>{', '.join(cb.get('attempted_queries', []))}</code><br>
-                    • <strong>建议向知识库补充的资料</strong>:<br>
-                    {recs_md}
-                </div>
-                """, unsafe_allow_html=True)
-
     # 渲染 Markdown 报告
     if st.session_state.final_report:
-        check_results = st.session_state.consistency_checks
-        failed_checks = [item for item in check_results if item.get("status") != "passed"]
-        if check_results and failed_checks:
-            st.warning(f"最终一致性检查未完成或未通过：{len(failed_checks)}/{len(check_results)} 个条款。初稿可能仍有事实冲突或依据错配，请优先复核。")
-        elif check_results:
-            st.info(f"已执行 {len(check_results)} 个条款的一致性复核；引用依据仍请结合原文核对。")
         evidence_records = st.session_state.evidence_records
         if evidence_records:
-            with st.expander(f"📚 本次检索依据（{len(evidence_records)} 条，点击查看命中原文）", expanded=True):
+            source_labels = {
+                "law": "法规",
+                "enterprise_document": "企业资料",
+                "enterprise_rule": "企业规则",
+                "general_document": "通用资料",
+            }
+            source_counts = {
+                label: sum(item.get("source_type") == source_type for item in evidence_records.values())
+                for source_type, label in source_labels.items()
+            }
+            source_summary = "，".join(
+                f"{label} {count} 条" for label, count in source_counts.items() if count
+            )
+            with st.expander(f"📚 本次检索依据（共 {len(evidence_records)} 条：{source_summary}）", expanded=True):
                 for evidence_id, evidence in evidence_records.items():
                     citation = f"《{evidence.get('doc_name', '参考文档')}》"
                     if evidence.get("article_no"):
                         citation += f" {evidence['article_no']}"
                     if evidence.get("title"):
                         citation += f" {evidence['title']}"
-                    citation += f" · 第 {evidence.get('page_start', '?')} 页"
+                    source_label = source_labels.get(evidence.get("source_type"), "资料")
+                    citation = f"[{source_label}] {citation}"
+                    if evidence.get("source_location"):
+                        citation += f" · {evidence['source_location']}"
+                    elif evidence.get("page_start") is not None:
+                        citation += f" · 第 {evidence['page_start']} 页"
+                    if evidence.get("enterprise_risk_level"):
+                        citation += f" · 内部等级 {evidence['enterprise_risk_level']}"
                     if st.button(f"查看原文：{citation}", key=f"all_evidence_{evidence_id}"):
                         show_evidence_content(evidence)
         else:
-            st.info("本次审查没有收集到法规原文证据。若报告列出了法条依据，请确认法规检索工具已成功返回结果后重新审查。")
+            st.info("本次审查没有收集到可展示的检索依据。")
         if st.session_state.structured_report is None:
             parsed_report = parse_structured_report(st.session_state.final_report)
             if parsed_report:
@@ -1073,6 +1297,8 @@ with st.container():
                         if item.get("risk_type"):
                             st.markdown(f"**风险类型：** {item['risk_type']}")
                         st.markdown(f"**风险等级：** {label}")
+                        if item.get("enterprise_risk_level"):
+                            st.markdown(f"**企业内部风险等级：** {item['enterprise_risk_level']}")
                         if item.get("affected_party"):
                             st.markdown(f"**受影响方：** {item['affected_party']}")
                         if item.get("confidence"):
@@ -1096,6 +1322,11 @@ with st.container():
                             st.markdown("**法律/合规依据：** 关联以下检索原文（请核对原文是否支持本项分析）")
                         else:
                             st.markdown("**法律/合规依据：** 未检索到直接依据")
+                        enterprise_basis = format_report_evidence_refs(
+                            item.get("enterprise_basis", ""), st.session_state.evidence_records
+                        ).strip()
+                        if enterprise_basis:
+                            st.markdown(f"**企业知识库依据：** {enterprise_basis}")
                         for evidence_id in evidence_ids:
                             evidence = st.session_state.evidence_records.get(evidence_id)
                             if evidence:
@@ -1120,13 +1351,13 @@ with st.container():
                             st.divider()
             with st.expander("查看完整原始审查报告"):
                 st.markdown(format_report_evidence_refs(
-                    clean_report_content(st.session_state.final_report),
+                    report_text_for_display(st.session_state.final_report),
                     st.session_state.evidence_records,
                 ))
         else:
             st.warning("报告未能解析成风险条目，以下显示完整原始报告。")
             st.markdown(format_report_evidence_refs(
-                clean_report_content(st.session_state.final_report),
+                report_text_for_display(st.session_state.final_report),
                 st.session_state.evidence_records,
             ))
 
@@ -1134,7 +1365,8 @@ with st.container():
         export_col1, export_col2 = st.columns(2)
         export_filename = f"contract_review_{int(time.time())}"
         readable_report = format_report_evidence_refs(
-            st.session_state.final_report, st.session_state.evidence_records
+            report_text_for_display(st.session_state.final_report),
+            st.session_state.evidence_records,
         )
         with export_col1:
             st.download_button(

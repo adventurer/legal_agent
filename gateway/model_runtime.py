@@ -216,8 +216,6 @@ class ModelRuntime:
         import sys
 
         from configs import config
-        from gateway import review_orchestrator
-
         api_server_path = Path(__file__).with_name("api_server.py").resolve()
         main_module = sys.modules.get("__main__")
         if (
@@ -239,8 +237,6 @@ class ModelRuntime:
         config.DEFAULT_MODEL_NAME = preset["served_name"]
         config.AGENT_CONFIG["model"] = preset["served_name"]
         config.AGENT_CONFIG["max_context_tokens"] = preset["max_model_len"]
-        review_orchestrator.MODEL_MAX_CONTEXT = preset["max_model_len"]
-        review_orchestrator.CONTEXT_THRESHOLD_95 = int(preset["max_model_len"] * 0.95)
 
 
 model_runtime = ModelRuntime()

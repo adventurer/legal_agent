@@ -31,6 +31,12 @@ LAW_NAME_HINTS = (
 
 def determine_tag(filename: str) -> str:
     name = Path(filename).stem.lower()
+    if name.startswith("通用_"):
+        return "通用"
+    if name.startswith("合规_"):
+        return "合规"
+    if name.startswith("法典_"):
+        return "法"
     if any(word in name for word in POLICY_NAME_HINTS):
         return "合规"
     if any(word in name for word in LAW_NAME_HINTS):
@@ -214,11 +220,16 @@ def load_documents(docs_dir: Path) -> List[Dict[str, Any]]:
         print(f"[警告] 知识库目录不存在: {docs_dir}")
         return []
     pdf_files = list(docs_dir.glob("*.pdf"))
-    law_text_files = list(docs_dir.glob("*.law.txt"))
-    print(f"[*] 正在从 {docs_dir} 加载参考文档，发现 {len(pdf_files)} 个 PDF 和 {len(law_text_files)} 个法律文本文件...")
+    text_files = sorted(
+        path for path in docs_dir.iterdir()
+        if path.is_file()
+        and path.suffix.lower() in {".txt", ".md"}
+        and not path.name.lower().endswith(".pdf.txt")
+    )
+    print(f"[*] 正在从 {docs_dir} 加载参考文档，发现 {len(pdf_files)} 个 PDF 和 {len(text_files)} 个文本文件...")
     pages: List[Dict[str, Any]] = []
     articles: List[Dict[str, Any]] = []
-    for text_path in law_text_files:
+    for text_path in text_files:
         doc_name, tag = text_path.name, determine_tag(text_path.name)
         source_hash = _sha256(text_path)
         article_cache_path = text_path.with_suffix(".articles.json")

@@ -2,9 +2,10 @@
 
 import json
 import re
-from typing import Any, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from core.schemas import ContractReviewReport
+from core.prompts import RISK_LEVEL_REPORT_LEGEND
 
 
 REPORT_SIGNATURES = (
@@ -16,6 +17,41 @@ REPORT_SIGNATURES = (
     "### 1.",
     "1. 违约",
     "1. 争议",
+)
+
+REPORT_FIELD_PATTERNS = (
+    ("风险类型", r"风险类型"),
+    ("风险等级", r"风险等级"),
+    ("企业内部风险等级", r"企业(?:内部)?风险等级"),
+    ("法律效力", r"法律效力"),
+    ("商业后果", r"商业后果"),
+    ("救济成本", r"救济成本"),
+    ("受影响方", r"受影响方|影响受方"),
+    ("结论置信度", r"结论置信度|证据置信度"),
+    ("法律/合规依据", r"法律/合规依据|法律依据|合规依据"),
+    ("企业知识库依据", r"企业(?:内部|知识库)?依据|业务资料依据"),
+    ("风险剖析", r"风险剖析|风险说明|风险分析"),
+    ("修改建议", r"修改建议|建议修改"),
+)
+
+REPORT_SOURCE_FIELD_PATTERNS = {
+    "risk_type": r"风险类型",
+    "risk_level": r"风险等级",
+    "enterprise_risk_level": r"企业(?:内部)?风险等级",
+    "legal_effect": r"法律效力",
+    "commercial_impact": r"商业后果",
+    "remedy_cost": r"救济成本",
+    "affected_party": r"受影响方|影响受方",
+    "confidence": r"结论置信度|证据置信度",
+    "legal_basis": r"法律(?:/合规)?依据|合规依据",
+    "enterprise_basis": r"企业(?:内部|知识库)?依据|业务资料依据",
+    "issue": r"风险剖析|风险说明|风险分析",
+    "suggested_revision": r"修改建议|建议修改",
+}
+
+NUMBERED_HEADING_PATTERN = (
+    r"^(?:\d+(?:\.\d+)*(?:[.、)]?)(?:\s|$)"
+    r"|第[一二三四五六七八九十百千万零〇两\d]+条(?:\s|$))"
 )
 
 
@@ -45,6 +81,223 @@ def clean_report_content(raw_text: str) -> str:
     return cleaned.strip()
 
 
+def validate_report_structure(raw_text: str) -> list[str]:
+    """Return format violations against the required Markdown report structure."""
+    content = clean_report_content(raw_text)
+    issues = []
+    if not content.startswith(RISK_LEVEL_REPORT_LEGEND):
+        issues.append("风险等级提示缺失、不完整或未置于报告开头")
+
+    headings = list(re.finditer(r"(?m)^[ \t]*#{1,6}\s+(.+?)\s*$", content))
+    placeholder_headings = [
+        heading for heading in headings
+        if re.search(r"\[.*(?:条款名称|主题).*\]|条款名称/主题", heading.group(1))
+    ]
+    if placeholder_headings:
+        issues.append("报告中残留模板占位标题，须替换为合同原条款编号和名称")
+    numbered_headings = [
+        (index, heading)
+        for index, heading in enumerate(headings)
+        if heading not in placeholder_headings
+        if re.match(
+            r"^(?:\d+(?:\.\d+)*(?:[.、)]?)(?:\s|$)|第[一二三四五六七八九十百千万零〇两\d]+条(?:\s|$))",
+            heading.group(1).strip(),
+        )
+    ]
+    if not numbered_headings:
+        issues.append("缺少按合同原编号排列的条款标题")
+        return issues
+
+    for position, (heading_index, heading) in enumerate(numbered_headings, start=1):
+        next_heading_index = (
+            numbered_headings[position][0]
+            if position < len(numbered_headings)
+            else len(headings)
+        )
+        section_end = (
+            headings[next_heading_index].start()
+            if next_heading_index < len(headings)
+            else len(content)
+        )
+        section = content[heading.end():section_end]
+        field_positions = []
+        missing_fields = []
+        for label, pattern in REPORT_FIELD_PATTERNS:
+            match = re.search(
+                rf"(?im)^\s*(?:#{{1,6}}\s*)?[-*+]??\s*(?:\*\*)?(?:{pattern})(?:\*\*)?\s*[:：]",
+                section,
+            )
+            if match:
+                field_positions.append((label, match.start()))
+            else:
+                missing_fields.append(label)
+        topic = heading.group(1).strip()
+        if missing_fields:
+            issues.append(f"条款“{topic}”缺少字段：{'、'.join(missing_fields)}")
+        if len(field_positions) == len(REPORT_FIELD_PATTERNS):
+            actual_order = [label for label, _ in sorted(field_positions, key=lambda item: item[1])]
+            expected_order = [label for label, _ in REPORT_FIELD_PATTERNS]
+            if actual_order != expected_order:
+                issues.append(f"条款“{topic}”字段顺序与模板不一致")
+    return issues
+
+
+def normalize_report_structure(
+    raw_text: str,
+    evidence_supplements: Optional[Dict[str, Dict[str, str]]] = None,
+) -> Optional[str]:
+    """Reformat existing clause content without generating legal analysis."""
+    def article_title(raw_title: str) -> Optional[str]:
+        wrapped = re.match(
+            r"^\d+(?:\.\d+)*(?:[.、)]?)\s*[\[【](第[一二三四五六七八九十百千万零〇两\d]+条.+?)[\]】]$",
+            raw_title.strip(),
+        )
+        title = wrapped.group(1).strip() if wrapped else raw_title.strip(" []【】")
+        if re.match(
+            r"^第[一二三四五六七八九十百千万零〇两\d]+条(?:\s|$)", title
+        ):
+            return title
+        return None
+
+    content = clean_report_content(raw_text)
+    headings = list(re.finditer(r"(?m)^[ \t]*#{1,6}\s+(.+?)\s*$", content))
+    numbered = [
+        (index, heading)
+        for index, heading in enumerate(headings)
+        if not re.search(r"\[.*(?:条款名称|主题).*\]|条款名称/主题", heading.group(1))
+        if re.match(NUMBERED_HEADING_PATTERN, heading.group(1).strip())
+    ]
+    if not numbered:
+        return None
+
+    candidates = []
+    article_context_by_heading = {}
+    for position, (heading_index, heading) in enumerate(numbered):
+        title = heading.group(1).strip()
+        normalized_article_title = article_title(title)
+        title = normalized_article_title or title.strip(" []【】")
+        is_article_heading = normalized_article_title is not None
+        next_article_position = next(
+            (
+                child_position
+                for child_position in range(position + 1, len(numbered))
+                if article_title(numbered[child_position][1].group(1))
+            ),
+            len(numbered),
+        )
+        child_headings = numbered[position + 1:next_article_position]
+        has_numbered_child = is_article_heading and bool(child_headings)
+        if has_numbered_child:
+            first_child = child_headings[0][1]
+            article_context_by_heading[headings.index(first_child)] = content[
+                heading.end():first_child.start()
+            ]
+        if title and not has_numbered_child:
+            candidates.append((heading_index, heading, title))
+    if not candidates:
+        return None
+
+    required_fields = (
+        ("风险类型", "risk_type"),
+        ("风险等级", "risk_level"),
+        ("企业内部风险等级", "enterprise_risk_level"),
+        ("法律效力", "legal_effect"),
+        ("商业后果", "commercial_impact"),
+        ("救济成本", "remedy_cost"),
+        ("受影响方", "affected_party"),
+        ("结论置信度", "confidence"),
+        ("法律/合规依据", "legal_basis"),
+        ("企业知识库依据", "enterprise_basis"),
+        ("风险剖析", "issue"),
+        ("修改建议", "suggested_revision"),
+    )
+    missing_field_defaults = {
+        "enterprise_risk_level": "未检索到企业内部风险等级",
+        "enterprise_basis": "未检索到相关企业规则或知识库依据",
+    }
+    evidence_supplements = evidence_supplements or {}
+    output_sections = []
+    for position, (heading_index, heading, title) in enumerate(candidates):
+        next_heading_index = (
+            candidates[position + 1][0]
+            if position + 1 < len(candidates)
+            else len(headings)
+        )
+        section_end = (
+            headings[next_heading_index].start()
+            if next_heading_index < len(headings)
+            else len(content)
+        )
+        section = (
+            article_context_by_heading.get(heading_index, "")
+            + content[heading.end():section_end]
+        )
+        lines = section.splitlines()
+        markers = []
+        for line_index, line in enumerate(lines):
+            for field, pattern in REPORT_SOURCE_FIELD_PATTERNS.items():
+                match = re.match(
+                    rf"^\s*(?:#{{1,6}}\s*)?(?:[-*+]\s*)?(?:\*\*)?(?:{pattern})(?:\*\*)?\s*[:：]\s*(.*)$",
+                    line,
+                    re.IGNORECASE,
+                )
+                if match:
+                    markers.append((line_index, field, match.group(1).strip()))
+                    break
+
+        values = {}
+        covered_lines = set()
+        for marker_index, (line_index, field, first_line) in enumerate(markers):
+            end_line = markers[marker_index + 1][0] if marker_index + 1 < len(markers) else len(lines)
+            value_lines = ([first_line] if first_line else []) + [
+                line.strip() for line in lines[line_index + 1:end_line] if line.strip()
+            ]
+            value = "\n".join(value_lines).strip()
+            if value:
+                values[field] = "\n".join(
+                    part for part in (values.get(field), value) if part
+                )
+            covered_lines.update(range(line_index, end_line))
+
+        unlabelled_content = "\n".join(
+            line.strip() for index, line in enumerate(lines)
+            if index not in covered_lines
+            and line.strip()
+            and not line.lstrip().startswith("#")
+            and line.strip() not in {"---", "***"}
+        ).strip()
+        if unlabelled_content:
+            values["issue"] = "\n".join(
+                part for part in (values.get("issue"), unlabelled_content) if part
+            )
+
+        fields = [f"### {title}"]
+        normalized_title = re.sub(r"^\s*\d+[.、)]\s*", "", title).strip()
+        supplement = evidence_supplements.get(title) or evidence_supplements.get(
+            normalized_title, {}
+        )
+        for label, field in required_fields:
+            value = (
+                supplement.get(field)
+                if field in {
+                    "risk_level", "enterprise_risk_level", "enterprise_basis",
+                } and supplement.get(field)
+                else values.get(field)
+            )
+            if not value or value in {
+                "初稿未提供",
+                "未检索到企业内部风险等级",
+                "未检索到相关企业规则或知识库依据",
+            }:
+                value = supplement.get(field) or missing_field_defaults.get(
+                    field, "初稿未提供"
+                )
+            fields.append(f"- **{label}**: {value}")
+        output_sections.append("\n".join(fields))
+
+    return RISK_LEVEL_REPORT_LEGEND + "\n\n" + "\n\n".join(output_sections)
+
+
 def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
     """解析 JSON 报告，或解析系统约定格式的 Markdown 条目。"""
     content = clean_report_content(raw_text)
@@ -55,17 +308,19 @@ def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
-    headings = list(re.finditer(r"(?m)^#{1,6}\s+(.+?)\s*$", content))
+    headings = list(re.finditer(r"(?m)^[ \t]*#{1,6}\s+(.+?)\s*$", content))
     reviews = []
     field_patterns = {
         "risk_level": r"风险等级",
+        "enterprise_risk_level": r"企业(?:内部)?风险等级",
         "risk_type": r"风险类型",
         "legal_effect": r"法律效力",
         "commercial_impact": r"商业后果",
         "remedy_cost": r"救济成本",
-        "affected_party": r"受影响方",
+        "affected_party": r"受影响方|影响受方",
         "confidence": r"结论置信度|证据置信度",
         "legal_basis": r"法律(?:/合规)?依据|合规依据",
+        "enterprise_basis": r"企业(?:内部|知识库)?依据|业务资料依据",
         "issue": r"风险剖析|风险说明|风险分析",
         "suggested_revision": r"修改建议|建议修改",
     }
@@ -77,7 +332,7 @@ def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
         values = {}
         for field, label_pattern in field_patterns.items():
             match = re.search(
-                rf"(?im)^\s*[-*+]?\s*(?:\*\*)?(?:{label_pattern})(?:\*\*)?\s*[:：]\s*(.+?)\s*$",
+                rf"(?im)^\s*(?:#{{1,6}}\s*)?[-*+]?\s*(?:\*\*)?(?:{label_pattern})(?:\*\*)?\s*[:：]\s*(.+?)\s*$",
                 section,
             )
             if match:

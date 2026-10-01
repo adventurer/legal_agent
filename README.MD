@@ -64,7 +64,7 @@ curl -i http://127.0.0.1:8000/v1/models
 python server/vllm_launcher.py --model qwen2.5-7b-awq --no-fp8-kv
 python server/vllm_launcher.py --model qwen2.5-3b --no-fp8-kv
 python gateway/api_server.py
-streamlit run web/app_ui.py --server.port 8501
+streamlit run web/main.py --server.port 8501
 
 # 可选运行配置
 # MAX_UPLOAD_BYTES=20971520      # 合同上传大小上限，默认 20 MiB

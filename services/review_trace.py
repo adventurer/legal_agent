@@ -72,7 +72,7 @@ class ReviewTrace:
         except (TypeError, ValueError):
             event, payload = "unknown", {"raw_data": str(item)}
 
-        if event == "token":
+        if event in {"token", "report_token"}:
             self._assistant_text += str(payload.get("token", ""))
             return
 

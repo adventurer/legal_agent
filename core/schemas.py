@@ -51,6 +51,14 @@ class ReviewItem(BaseModel):
         default=None,
         description="主要风险类型：法律合规、履约、商业或表述"
     )
+    enterprise_risk_level: Optional[str] = Field(
+        default=None,
+        description="命中自编法典时记录原样的企业内部风险等级，与统一审查风险等级分开"
+    )
+    enterprise_basis: Optional[str] = Field(
+        default=None,
+        description="企业规则、企业知识库或通用资料的来源与定位，不作为法律依据"
+    )
     confidence: Optional[str] = Field(
         default=None,
         description="结论置信度：高、中或低；独立于风险等级"
@@ -58,10 +66,10 @@ class ReviewItem(BaseModel):
     legal_effect: Optional[str] = Field(default=None, description="法律效力维度判断")
     commercial_impact: Optional[str] = Field(default=None, description="商业后果维度判断")
     remedy_cost: Optional[str] = Field(default=None, description="救济成本维度判断")
-    affected_party: Optional[str] = Field(default=None, description="主要受影响方：买方、卖方或双方")
+    affected_party: Optional[str] = Field(default=None, description="主要受影响方：甲方、乙方或双方")
     legal_basis: str = Field(
         ..., 
-        description="参考的法律法规或公司合规手册依据，附带文件名与页码"
+        description="支持法律结论的法规条文及其法规证据编号；无直接依据时应明确说明"
     )
     issue: str = Field(
         ..., 
@@ -79,6 +87,21 @@ class ReviewItem(BaseModel):
         if isinstance(v, str):
             return v.strip()
         return str(v) if v is not None else ""
+
+    @field_validator("risk_type", mode="before")
+    @classmethod
+    def clear_risk_level_misclassified_as_type(cls, value: Any) -> Optional[str]:
+        """Do not expose a risk grade as the separate risk category."""
+        if not isinstance(value, str):
+            return value
+        normalized = value.strip().strip("* ")
+        level_labels = {
+            "高风险", "中风险", "低风险", "提示",
+            "high", "medium", "med", "low", "notice",
+        }
+        if normalized.casefold() in {label.casefold() for label in level_labels}:
+            return None
+        return normalized or None
 
 
 class ContractReviewReport(BaseModel):
@@ -136,7 +159,7 @@ class ReviewRequest(BaseModel):
     )
     review_side: Literal["buyer", "seller", "neutral"] = Field(
         default="neutral",
-        description="审查立场：买方、卖方或中立",
+        description="审查立场：甲方、乙方或中立",
     )
 
 

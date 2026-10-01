@@ -114,7 +114,7 @@ AGENT_CONFIG: Dict[str, Any] = {
     "temperature": 0.0,       # 设为 0 启用贪婪解码，保持法律审查结论高度确定
     "top_p": 1.0,
     "seed": 42,               # 显式固定随机种子
-    "max_tokens": 1024,       # 单步生成最大 Token 数
+    "max_tokens": 2048,       # 单步生成最大 Token 数
     "stop": ["Observation:"], # ReAct 工具调用截断符
     "max_turns": 6,           # 默认最大推理轮次
     "max_context_tokens": VLLM_CONFIG["max_model_len"],

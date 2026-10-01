@@ -5,6 +5,12 @@ import re
 from typing import Any, Dict, List, Optional
 
 
+_QUERY_STOPWORDS = {
+    "中国", "法律", "法规", "法律法规", "合同法", "法条", "相关", "现行", "依据",
+    "规定", "检索", "查询", "合同", "条款",
+}
+
+
 def search_pages(
     pages: List[Dict[str, Any]], query: str, filter_tag: Optional[str] = None,
     top_k: int = 2, max_snippet_len: int = 350,
@@ -18,27 +24,45 @@ def search_pages(
         for part in re.split(r"[\s，,；;、。/|]+", query)
         if part.strip()
     ]
-    keywords = set(query_parts)
-    for part in query_parts:
+    meaningful_parts = [part for part in query_parts if part not in _QUERY_STOPWORDS]
+    if not meaningful_parts:
+        return json.dumps({
+            "evidence": [],
+            "message": "查询词过于宽泛，请提供具体法律概念或规则名称。",
+        }, ensure_ascii=False)
+
+    keywords = set(meaningful_parts)
+    term_ngrams: Dict[str, set[str]] = {}
+    for part in meaningful_parts:
         if re.search(r"[\u3400-\u9fff]", part) and len(part) > 2:
-            keywords.update(part[index:index + 2] for index in range(len(part) - 1))
+            term_ngrams[part] = {
+                part[index:index + 2] for index in range(len(part) - 1)
+            }
+            keywords.update(term_ngrams[part])
     candidates = []
     for page in pages:
         if filter_tag and page.get("tag") != filter_tag:
             continue
         text = re.sub(r"\s+", "", page["text"].lower())
-        compact_query_parts = [re.sub(r"\s+", "", part) for part in query_parts]
+        compact_query_parts = [re.sub(r"\s+", "", part) for part in meaningful_parts]
         exact_score = sum(
             text.count(keyword) * (len(keyword) + 1)
             for keyword in compact_query_parts if keyword
         )
         matched_ngrams = sorted([
-            keyword for keyword in keywords.difference(query_parts)
+            keyword for keyword in keywords.difference(meaningful_parts)
             if text.count(keyword)
         ], key=lambda keyword: (-len(keyword), keyword))
         score = exact_score + sum(min(text.count(keyword), 3) for keyword in matched_ngrams)
-        if exact_score or len(matched_ngrams) >= 2:
-            coverage = len(matched_ngrams) / max(1, len(keywords.difference(query_parts)))
+        matched_set = set(matched_ngrams)
+        matched_terms = sum(
+            compact_part in text
+            or bool(term_ngrams.get(part, set()).intersection(matched_set))
+            for part, compact_part in zip(meaningful_parts, compact_query_parts)
+        )
+        coverage = matched_terms / len(meaningful_parts)
+        minimum_coverage = min(0.5, 2 / len(meaningful_parts))
+        if coverage >= minimum_coverage and (exact_score or len(matched_ngrams) >= 2):
             candidates.append((score, coverage, page, matched_ngrams))
     if not candidates:
         tag_desc = f"[{filter_tag}类]" if filter_tag else ""
@@ -52,7 +76,7 @@ def search_pages(
     )[:max(0, top_k)]
     for index, (_, _, page, matched_ngrams) in enumerate(ordered, 1):
         text = page["text"]
-        matched_terms = [term for term in query_parts if term]
+        matched_terms = [term for term in meaningful_parts if term]
         matched_terms.extend(matched_ngrams)
         matches = []
         for term in matched_terms:
@@ -75,6 +99,12 @@ def search_pages(
             snippet = text[:max_snippet_len] + "..."
         results.append({
             "id": page.get("id", f"EV{index}"), "doc_name": page["doc_name"],
+            "tag": page.get("tag"),
+            "source_type": {
+                "法": "law",
+                "合规": "enterprise_document",
+                "通用": "general_document",
+            }.get(page.get("tag"), "reference_document"),
             "article_no": page.get("article_no"), "title": page.get("title", ""),
             "page_start": page.get("page_start", page.get("page_num")),
             "page_end": page.get("page_end", page.get("page_num")),

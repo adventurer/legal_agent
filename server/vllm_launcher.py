@@ -118,6 +118,9 @@ def launch_vllm_server(
         "--seed",
         str(seed),
         "--enforce-eager",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "hermes",
     ]
 
     if cfg.get("quantization"):
