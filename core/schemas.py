@@ -10,7 +10,7 @@
 """
 
 from enum import Enum
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Literal
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 
@@ -19,6 +19,7 @@ class RiskLevel(str, Enum):
     HIGH = "High"
     MEDIUM = "Medium"
     LOW = "Low"
+    NOTICE = "Notice"
 
     @classmethod
     def _missing_(cls, value: object):
@@ -31,6 +32,8 @@ class RiskLevel(str, Enum):
                 return cls.MEDIUM
             elif "low" in val_lower or "低" in val_lower:
                 return cls.LOW
+            elif "notice" in val_lower or "提示" in val_lower:
+                return cls.NOTICE
         return cls.LOW
 
 
@@ -42,8 +45,20 @@ class ReviewItem(BaseModel):
     )
     risk_level: RiskLevel = Field(
         default=RiskLevel.LOW,
-        description="与法律规范冲突为 High；可能导致合同无法履行为 Medium；其他为 Low"
+        description="High、Medium、Low 或 Notice 四级，按共享风险分级规则判断"
     )
+    risk_type: Optional[str] = Field(
+        default=None,
+        description="主要风险类型：法律合规、履约、商业或表述"
+    )
+    confidence: Optional[str] = Field(
+        default=None,
+        description="结论置信度：高、中或低；独立于风险等级"
+    )
+    legal_effect: Optional[str] = Field(default=None, description="法律效力维度判断")
+    commercial_impact: Optional[str] = Field(default=None, description="商业后果维度判断")
+    remedy_cost: Optional[str] = Field(default=None, description="救济成本维度判断")
+    affected_party: Optional[str] = Field(default=None, description="主要受影响方：买方、卖方或双方")
     legal_basis: str = Field(
         ..., 
         description="参考的法律法规或公司合规手册依据，附带文件名与页码"
@@ -88,6 +103,11 @@ class ContractReviewReport(BaseModel):
         """低风险项统计"""
         return sum(1 for item in self.reviews if item.risk_level == RiskLevel.LOW)
 
+    @property
+    def notice_count(self) -> int:
+        """履约/商务提示项统计"""
+        return sum(1 for item in self.reviews if item.risk_level == RiskLevel.NOTICE)
+
 
 # ==================== 网关与调度层通信契约 ====================
 
@@ -113,6 +133,10 @@ class ReviewRequest(BaseModel):
         min_length=1,
         max_length=80,
         description="同一轮多条款审查共享的追踪批次 ID",
+    )
+    review_side: Literal["buyer", "seller", "neutral"] = Field(
+        default="neutral",
+        description="审查立场：买方、卖方或中立",
     )
 
 

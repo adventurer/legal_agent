@@ -19,6 +19,8 @@ from core.prompts import (
     EMPTY_SEARCH_RETRY_PROMPT,
     FINAL_CONSISTENCY_CHECK_PROMPT,
     FORCE_FINAL_CONVERGENCE_PROMPT,
+    RISK_GRADING_GUIDANCE,
+    REVIEW_SIDE_LABELS,
     TOOL_CALL_RETRY_PROMPT,
     USER_CONTRACT_INPUT_TEMPLATE,
     format_observation,
@@ -56,7 +58,9 @@ def context_budget_exceeded(input_tokens: int, output_budget: int) -> bool:
     return input_tokens + output_budget >= int(MODEL_MAX_CONTEXT * CONTEXT_SAFETY_RATIO)
 
 
-def _final_review_messages(contract_text: str, observations: List[str]) -> List[Dict[str, str]]:
+def _final_review_messages(
+    contract_text: str, observations: List[str], review_side: str
+) -> List[Dict[str, str]]:
     """Build a compact final-review context from the contract and actual tool evidence."""
     evidence_by_id: Dict[str, Dict[str, Any]] = {}
     for observation in observations:
@@ -91,10 +95,12 @@ def _final_review_messages(contract_text: str, observations: List[str]) -> List[
         "每个直接法律结论必须有内容相关的证据支持，并引用对应 [[EVIDENCE:编号]]；"
         "若证据不支持具体法律结论，写‘未检索到直接依据’，可说明商业风险。"
         "准确保留合同中已写明的期限、金额、责任和条件；不要把已有内容说成未约定。"
-        "按条款逐项输出风险等级、法律/合规依据、风险分析和修改建议。"
+        + RISK_GRADING_GUIDANCE
+        + "按条款逐项输出风险类型、风险等级、结论置信度、法律/合规依据、风险分析和修改建议。"
     )
+    review_side_label = REVIEW_SIDE_LABELS[review_side]
     user = (
-        "合同原文：\n" + contract_text +
+        f"审查立场：{review_side_label}\n合同原文：\n" + contract_text +
         "\n\n实际检索到的证据（只允许引用这里列出的编号）：\n" + evidence_text +
         "\n\n检索已经结束，请直接给出完整最终审查报告。"
     )
@@ -188,6 +194,7 @@ class ReviewOrchestrator:
         contract_text: str,
         draft_report: str,
         observations: List[str],
+        review_side: str,
     ) -> tuple[str, bool, str]:
         evidence = self._validation_evidence(observations, draft_report)
         check_messages = [
@@ -196,6 +203,7 @@ class ReviewOrchestrator:
                 "contract_text": contract_text,
                 "retrieved_evidence": evidence,
                 "draft_report": draft_report,
+                "review_side": REVIEW_SIDE_LABELS[review_side],
             }, ensure_ascii=False)},
         ]
         input_tokens = estimate_prompt_tokens(check_messages)
@@ -205,6 +213,7 @@ class ReviewOrchestrator:
                 "contract_text": contract_text,
                 "retrieved_evidence": evidence,
                 "draft_report": draft_report,
+                "review_side": REVIEW_SIDE_LABELS[review_side],
             }, ensure_ascii=False)
             input_tokens = estimate_prompt_tokens(check_messages)
         if input_tokens > MODEL_MAX_CONTEXT - 320:
@@ -237,13 +246,20 @@ class ReviewOrchestrator:
             return draft_report, False, f"复核调用失败，保留初稿：{exc}"
 
     async def stream(
-        self, contract_text: str, max_turns: int, task_label: str
+        self,
+        contract_text: str,
+        max_turns: int,
+        task_label: str,
+        review_side: str = "neutral",
     ) -> AsyncGenerator[Dict[str, str], None]:
         debug = self.debug
         max_search_budget = max(3, max_turns - 1)
         messages = [
             {"role": "system", "content": AGENT_SYSTEM_PROMPT},
-            {"role": "user", "content": USER_CONTRACT_INPUT_TEMPLATE.format(contract_text=contract_text)},
+            {"role": "user", "content": USER_CONTRACT_INPUT_TEMPLATE.format(
+                review_side=REVIEW_SIDE_LABELS[review_side],
+                contract_text=contract_text,
+            )},
         ]
         executed_tool_calls = set()
         tool_observations_by_action: Dict[str, str] = {}
@@ -276,7 +292,7 @@ class ReviewOrchestrator:
                 )})
 
             if force_converge_mode:
-                messages = _final_review_messages(contract_text, tool_observations)
+                messages = _final_review_messages(contract_text, tool_observations, review_side)
 
             is_last_turn = (turn == max_turns - 1) or force_converge_mode
             yield _event("turn_start", {
@@ -332,7 +348,7 @@ class ReviewOrchestrator:
                     ),
                     "attempted_queries": history_queries,
                 })
-                messages = _final_review_messages(contract_text, tool_observations)
+                messages = _final_review_messages(contract_text, tool_observations, review_side)
                 input_chars = sum(len(str(message.get("content", ""))) for message in messages)
                 input_tokens = estimate_prompt_tokens(messages)
                 current_max_tokens = max(
@@ -468,7 +484,7 @@ class ReviewOrchestrator:
                     })
                 else:
                     force_converge_mode = True
-                    messages = _final_review_messages(contract_text, tool_observations)
+                    messages = _final_review_messages(contract_text, tool_observations, review_side)
                     yield _event("circuit_break", {
                         "task_id": task_label,
                         "reason_type": "单次模型响应包含多个无效工具动作",
@@ -660,7 +676,7 @@ class ReviewOrchestrator:
                         "message": "正在逐项核对合同子条款、原文事实与检索依据",
                     })
                     checked_text, validation_ok, validation_message = await self._check_final_report(
-                        contract_text, final_text, tool_observations
+                        contract_text, final_text, tool_observations, review_side
                     )
                     if validation_ok:
                         changed = checked_text.strip() != final_text.strip()

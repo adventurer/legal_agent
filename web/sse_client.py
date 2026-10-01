@@ -12,6 +12,7 @@ def stream_contract_review(
     contract_text: str,
     max_turns: int,
     review_run_id: str | None = None,
+    review_side: str = "neutral",
     timeout: float = 180.0,
 ) -> Iterator[Dict[str, Any]]:
     """请求合同审查流，并将 SSE 事件转换为字典。"""
@@ -20,6 +21,7 @@ def stream_contract_review(
             "contract_text": contract_text,
             "max_turns": max_turns,
             "stream": True,
+            "review_side": review_side,
         }
         if review_run_id:
             payload["review_run_id"] = review_run_id

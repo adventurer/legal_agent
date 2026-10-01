@@ -9,9 +9,11 @@ from services.document_models import ContractClause
 class ClauseSplitter:
     """按一级条款切分合同，保留子条款完整性。"""
 
-    major_clause_pattern = re.compile(
-        r"^(?:第[一二三四五六七八九十百千万\d]+(?:条|章)|"
-        r"\d+、\s*|\d+\.\s+|[一二三四五六七八九十百]+[、. ])\s*(.*)$"
+    explicit_major_clause_pattern = re.compile(
+        r"^第[一二三四五六七八九十百千万\d]+(?:条|章)\s*(.*)$"
+    )
+    fallback_major_clause_pattern = re.compile(
+        r"^(?:\d+、\s*|\d+\.\s+|[一二三四五六七八九十百]+[、. ])\s*(.*)$"
     )
     sign_page_pattern = re.compile(
         r"^(?:（以下无正文|以下无正文|双方签署|协议签署盖章页|甲方（盖章）|乙方（盖章）|"
@@ -21,6 +23,9 @@ class ClauseSplitter:
     @classmethod
     def split(cls, full_text: str) -> List[ContractClause]:
         lines = [line.strip() for line in full_text.splitlines() if line.strip()]
+        has_explicit_major_headings = any(
+            cls.explicit_major_clause_pattern.match(line) for line in lines
+        )
         clauses: List[ContractClause] = []
         state = "PREAMBLE"
         preamble_lines = []
@@ -57,7 +62,11 @@ class ClauseSplitter:
                 sign_page_lines.append(line)
                 continue
 
-            if cls.major_clause_pattern.match(line):
+            is_major_heading = bool(cls.explicit_major_clause_pattern.match(line))
+            if not has_explicit_major_headings:
+                is_major_heading = bool(cls.fallback_major_clause_pattern.match(line))
+
+            if is_major_heading:
                 if state == "PREAMBLE":
                     if preamble_lines:
                         counter += 1

@@ -59,10 +59,17 @@ def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
     reviews = []
     field_patterns = {
         "risk_level": r"风险等级",
+        "risk_type": r"风险类型",
+        "legal_effect": r"法律效力",
+        "commercial_impact": r"商业后果",
+        "remedy_cost": r"救济成本",
+        "affected_party": r"受影响方",
+        "confidence": r"结论置信度|证据置信度",
         "legal_basis": r"法律(?:/合规)?依据|合规依据",
         "issue": r"风险剖析|风险说明|风险分析",
         "suggested_revision": r"修改建议|建议修改",
     }
+    required_fields = {"risk_level", "legal_basis", "issue", "suggested_revision"}
     for index, heading in enumerate(headings):
         end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
         section = content[heading.end():end]
@@ -75,7 +82,7 @@ def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
             )
             if match:
                 values[field] = match.group(1).strip().strip("* ")
-        if topic and all(field in values for field in field_patterns):
+        if topic and required_fields.issubset(values):
             reviews.append({"clause_topic": topic, **values})
     if not reviews:
         return None

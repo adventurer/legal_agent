@@ -252,7 +252,10 @@ async def review_contract_stream(request: ReviewRequest):
         trace_status = "interrupted"
         try:
             async for item in review_orchestrator.stream(
-                request.contract_text, limit_turns, task_label
+                request.contract_text,
+                limit_turns,
+                task_label,
+                request.review_side,
             ):
                 if item.get("event") == "start" and trace:
                     try:

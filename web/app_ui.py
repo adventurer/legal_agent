@@ -483,23 +483,39 @@ with st.expander("🛠️ 服务管理", expanded=health.get("status") != "healt
 
 with st.container():
     st.markdown('<div class="top-control-panel">', unsafe_allow_html=True)
-    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4 = st.columns([1.5, 1.1, 0.9, 0.9], gap="medium")
+    ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4, ctrl_col5 = st.columns(
+        [1.5, 1.1, 0.9, 1.0, 0.9], gap="medium"
+    )
 
     with ctrl_col1:
         review_mode = st.radio(
             "审查策略：",
-            ["分条款并发精审 (推荐·高效防截断)", "全篇逐条审查 (单线程汇总)"],
+            ["分条款并发精审 (推荐·高效防截断)", "全篇审查"],
             horizontal=False,
             index=0,
         )
 
     with ctrl_col2:
-        concurrency = st.slider("⚡ 并发线程数", min_value=1, max_value=100, value=8, step=1)
+        concurrency = st.slider(
+            "⚡ 并发线程数",
+            min_value=1,
+            max_value=100,
+            value=8,
+            step=1,
+            disabled=review_mode == "全篇审查",
+        )
 
     with ctrl_col3:
-        max_turns = st.slider("每轮最大探索步数", min_value=3, max_value=8, value=5, step=1)
+        max_turns = st.slider("每轮最大探索步数", min_value=3, max_value=30, value=10, step=1)
 
     with ctrl_col4:
+        review_side = st.selectbox(
+            "审查立场",
+            ["neutral", "buyer", "seller"],
+            format_func=lambda side: {"neutral": "中立", "buyer": "买方", "seller": "卖方"}[side],
+        )
+
+    with ctrl_col5:
         st.markdown("<div style='height: 24px;'></div>", unsafe_allow_html=True)
         if st.button("📋 载入买卖样例", use_container_width=True):
             sample_clauses = [
@@ -666,6 +682,7 @@ def execute_stream_review(
     text_to_review: str,
     target_name: str = "合同正文",
     review_run_id: Optional[str] = None,
+    review_side: str = "neutral",
 ) -> Optional[str]:
     st.session_state.is_reviewing = True
     st.session_state.structured_report = None
@@ -685,7 +702,11 @@ def execute_stream_review(
 
     try:
         for sse in stream_contract_review(
-            API_BASE_URL, text_to_review, max_turns, review_run_id=review_run_id
+            API_BASE_URL,
+            text_to_review,
+            max_turns,
+            review_run_id=review_run_id,
+            review_side=review_side,
         ):
             event = sse["event"]
             data = sse["data"]
@@ -742,6 +763,7 @@ def execute_stream_review(
                     state="error",
                     expanded=True,
                 )
+                st.session_state.is_reviewing = False
                 return None
             elif event == "final_report":
                 if not data.get("is_complete", data.get("status") == "success"):
@@ -750,6 +772,7 @@ def execute_stream_review(
                         state="error",
                         expanded=True,
                     )
+                    st.session_state.is_reviewing = False
                     return None
                 extracted_final = data.get("raw_report", "")
                 st.session_state.structured_report = data.get("structured_report")
@@ -768,6 +791,7 @@ def execute_stream_review(
 
         if not extracted_final:
             status_box.update(label="⚠️ 未收到完整审查报告", state="error", expanded=True)
+            st.session_state.is_reviewing = False
             return None
 
         st.session_state.is_reviewing = False
@@ -780,7 +804,7 @@ def execute_stream_review(
 
 # ==================== 7. 多线程并发调度器 ====================
 def _worker_clause_review(
-    clause: Dict[str, Any], turns: int, review_run_id: str
+    clause: Dict[str, Any], turns: int, review_run_id: str, review_side: str
 ) -> Dict[str, Any]:
     clause_text = clause_review_text(clause)
     accumulated_tokens = ""
@@ -793,7 +817,11 @@ def _worker_clause_review(
 
     try:
         for sse in stream_contract_review(
-            API_BASE_URL, clause_text, turns, review_run_id=review_run_id
+            API_BASE_URL,
+            clause_text,
+            turns,
+            review_run_id=review_run_id,
+            review_side=review_side,
         ):
             event = sse["event"]
             data = sse["data"]
@@ -849,6 +877,7 @@ def _worker_clause_review(
 def execute_concurrent_clause_review(
     clauses_to_review: List[Dict[str, Any]], max_workers: int,
     review_run_id: Optional[str] = None,
+    review_side: str = "neutral",
 ) -> str:
     st.session_state.is_reviewing = True
     st.session_state.structured_report = None
@@ -874,7 +903,7 @@ def execute_concurrent_clause_review(
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
-            executor.submit(_worker_clause_review, c, max_turns, review_run_id): c["index"]
+            executor.submit(_worker_clause_review, c, max_turns, review_run_id, review_side): c["index"]
             for c in clauses_to_review
         }
         for future in as_completed(future_map):
@@ -921,7 +950,11 @@ with st.container():
             st.session_state.evidence_records = {}
             st.session_state.consistency_checks = []
             target_text = clause_review_text(target_clause)
-            report = execute_stream_review(target_text, target_name=target_clause["title"])
+            report = execute_stream_review(
+                target_text,
+                target_name=target_clause["title"],
+                review_side=review_side,
+            )
             if report:
                 st.session_state.final_report = f"## 针对【{target_clause['title']}】的专属审查意见\n\n" + report
                 st.rerun()
@@ -932,11 +965,18 @@ with st.container():
         review_run_id = uuid.uuid4().hex
         if not st.session_state.full_contract_text.strip():
             st.warning("请先上传合同文件或载入样例数据！")
+        elif review_mode == "全篇审查":
+            st.session_state.final_report = ""
+            report = execute_stream_review(
+                st.session_state.full_contract_text,
+                target_name="全篇合同",
+                review_run_id=review_run_id,
+                review_side=review_side,
+            )
+            if report:
+                st.session_state.final_report = report
+                st.rerun()
         else:
-            # Keep the full-contract report and the per-clause report on the
-            # same source of truth: review each clause once, then assemble the
-            # whole report from those exact results. A separate full-text model
-            # pass could invent omissions or conclusions that contradict them.
             article_clauses = [
                 c for c in st.session_state.clauses if c.get("type") == "article"
             ] or st.session_state.clauses
@@ -948,13 +988,13 @@ with st.container():
                     "content": st.session_state.full_contract_text,
                 }]
 
-            workers = concurrency if "并发精审" in review_mode else 1
+            st.session_state.final_report = ""
             st.session_state.final_report = execute_concurrent_clause_review(
                 article_clauses,
-                max_workers=workers,
+                max_workers=concurrency,
                 review_run_id=review_run_id,
+                review_side=review_side,
             )
-            st.session_state.structured_report = None
             st.rerun()
 
     # 渲染前端收集到的所有熔断告警与知识库增补清单
@@ -1002,12 +1042,13 @@ with st.container():
         structured_reviews = (st.session_state.structured_report or {}).get("reviews", [])
         if structured_reviews:
             st.caption(
-                "分级标准：与适用法律规范冲突为高风险；可能导致合同无法履行为中风险；其他为低风险。"
+                "按法律效力、商业后果、救济成本及所选审查立场综合分级；纯执行能力要求归为提示。"
             )
             risk_levels = [
                 ("High", "高风险"),
                 ("Medium", "中风险"),
                 ("Low", "低风险"),
+                ("Notice", "履约/商务提示"),
             ]
             counts = {
                 level: sum(
@@ -1029,7 +1070,20 @@ with st.container():
                         st.info(f"当前报告没有{label}条款。")
                     for index, item in enumerate(items, 1):
                         st.markdown(f"#### {index}. {item.get('clause_topic', '未命名条款')}")
+                        if item.get("risk_type"):
+                            st.markdown(f"**风险类型：** {item['risk_type']}")
                         st.markdown(f"**风险等级：** {label}")
+                        if item.get("affected_party"):
+                            st.markdown(f"**受影响方：** {item['affected_party']}")
+                        if item.get("confidence"):
+                            st.markdown(f"**结论置信度：** {item['confidence']}")
+                        for field, label_text in (
+                            ("legal_effect", "法律效力"),
+                            ("commercial_impact", "商业后果"),
+                            ("remedy_cost", "救济成本"),
+                        ):
+                            if item.get(field):
+                                st.markdown(f"**{label_text}：** {item[field]}")
                         legal_basis = item.get("legal_basis", "")
                         evidence_ids = list(dict.fromkeys(re.findall(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", legal_basis)))
                         visible_basis = format_report_evidence_refs(
