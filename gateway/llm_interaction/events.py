@@ -103,6 +103,14 @@ class PipelineStagePayload(EventPayload):
     count: Optional[int] = None
 
 
+class RuleAssessmentPayload(EventPayload):
+    attempt: int
+    raw_response: str
+    rule_assessments: Any
+    validated_assessments: Dict[str, Any]
+    issues: list[str]
+
+
 EVENT_PAYLOADS: Dict[str, Type[EventPayload]] = {
     "start": StartPayload,
     "token": TokenPayload,
@@ -110,6 +118,7 @@ EVENT_PAYLOADS: Dict[str, Type[EventPayload]] = {
     "tool_start": ToolStartPayload,
     "tool_result": ToolResultPayload,
     "pipeline_stage": PipelineStagePayload,
+    "rule_assessment": RuleAssessmentPayload,
     "guardrail": GuardrailPayload,
     "model_start": ModelStartPayload,
     "model_tool_call": ModelToolCallPayload,

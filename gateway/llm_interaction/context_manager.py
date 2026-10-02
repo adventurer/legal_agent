@@ -6,6 +6,9 @@ from typing import Any, Dict, List
 import tiktoken
 
 
+INPUT_CONTEXT_RATIO = 0.98
+
+
 class ContextWindowError(ValueError):
     """Raised when fixed request content alone exceeds the model window."""
 
@@ -25,7 +28,7 @@ class ContextWindowManager:
             self._encoding = tiktoken.get_encoding("cl100k_base")
         self._max_input_tokens = max(
             128,
-            int(max_context_tokens * 0.92) - output_tokens,
+            int(max_context_tokens * INPUT_CONTEXT_RATIO) - output_tokens,
         )
         self._max_history_turns = max_history_turns
         self._max_observation_chars = max_observation_chars
@@ -54,16 +57,44 @@ class ContextWindowManager:
         self,
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
+        enterprise_evidence_pinned: bool = False,
     ) -> List[Dict[str, Any]]:
         fixed_messages = messages[:2]
         history = messages[2:]
-        turns = self._group_tool_turns(history)
-        turns = turns[-self._max_history_turns:]
+        trailing_messages = []
+        if history and history[-1].get("role") in {"system", "user"}:
+            trailing_messages = [history[-1]]
+            history = history[:-1]
+        all_turns = self._group_tool_turns(history)
+        evidence_turns = [] if enterprise_evidence_pinned else [
+            turn for turn in all_turns
+            if self._contains_enterprise_evidence(turn)
+        ]
+        evidence_turn_ids = {id(turn) for turn in evidence_turns}
+        other_turns = [
+            turn for turn in all_turns
+            if id(turn) not in evidence_turn_ids
+        ]
+        remaining_slots = max(0, self._max_history_turns - len(evidence_turns))
+        turns = sorted(
+            evidence_turns + (other_turns[-remaining_slots:] if remaining_slots else []),
+            key=all_turns.index,
+        )
 
-        while turns and self._estimate_request(fixed_messages + self._flatten(turns), tools) > self._max_input_tokens:
-            turns.pop(0)
+        while turns and self._estimate_request(
+            fixed_messages + self._flatten(turns) + trailing_messages,
+            tools,
+        ) > self._max_input_tokens:
+            removable_index = next(
+                (
+                    index for index, turn in enumerate(turns)
+                    if id(turn) not in evidence_turn_ids
+                ),
+                0,
+            )
+            turns.pop(removable_index)
 
-        fitted = fixed_messages + self._flatten(turns)
+        fitted = fixed_messages + self._flatten(turns) + trailing_messages
         estimated = self._estimate_request(fitted, tools)
         if estimated > self._max_input_tokens:
             raise ContextWindowError(
@@ -88,6 +119,26 @@ class ContextWindowManager:
             elif message.get("role") == "tool" and turns:
                 turns[-1].append(message)
         return turns
+
+    @staticmethod
+    def _contains_enterprise_evidence(turn: List[Dict[str, Any]]) -> bool:
+        for message in turn:
+            if message.get("role") != "tool":
+                continue
+            try:
+                payload = json.loads(message.get("content", ""))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            evidence = payload.get("evidence") if isinstance(payload, dict) else None
+            if isinstance(evidence, list) and any(
+                isinstance(item, dict)
+                and item.get("source_type") in {
+                    "enterprise_document", "enterprise_rule",
+                }
+                for item in evidence
+            ):
+                return True
+        return False
 
     @staticmethod
     def _flatten(turns: List[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:

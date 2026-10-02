@@ -1,5 +1,6 @@
 import unittest
 
+from core.prompts import RISK_LEVEL_REPORT_LEGEND
 from services.report_parser import (
     normalize_report_structure,
     parse_structured_report,
@@ -31,7 +32,7 @@ class ReportParserTests(unittest.TestCase):
         self.assertIsNotNone(normalized)
         self.assertIn("### 风险等级提示", normalized)
         self.assertIn("- **受影响方**: 双方", normalized)
-        self.assertIn("- **企业内部风险等级**: 未检索到企业内部风险等级", normalized)
+        self.assertIn("- **企业内部风险等级：** 未检索到企业内部风险等级", normalized)
         self.assertIn(
             "- **企业知识库依据**: 未检索到相关企业规则或知识库依据",
             normalized,
@@ -51,7 +52,9 @@ class ReportParserTests(unittest.TestCase):
         )
 
     def test_normalization_preserves_populated_enterprise_evidence_fields(self):
-        raw_report = """### 第三条 资料使用
+        raw_report = f"""{RISK_LEVEL_REPORT_LEGEND}
+
+    ### 第三条 资料使用
 - **风险类型**: 商业
 - **风险等级**: 中风险
 - **企业内部风险等级**: High
@@ -68,7 +71,7 @@ class ReportParserTests(unittest.TestCase):
 
         normalized = normalize_report_structure(raw_report)
 
-        self.assertIn("- **企业内部风险等级**: High", normalized)
+        self.assertIn("- **企业内部风险等级：** High", normalized)
         self.assertIn(
             "- **企业知识库依据**: reference_docs/policy.md · 第 4 页 [[KB:EV12]]",
             normalized,
@@ -92,10 +95,36 @@ class ReportParserTests(unittest.TestCase):
             },
         )
 
-        self.assertIn("- **企业内部风险等级**: High", normalized)
+        self.assertIn("- **企业内部风险等级：** High", normalized)
         self.assertIn(
             "- **企业知识库依据**: data/rule_book.db · 规则 RULE3 [[RULE:RULE3]]",
             normalized,
+        )
+
+    def test_parses_bold_enterprise_risk_label_with_chinese_colon_inside(self):
+        raw_report = f"""{RISK_LEVEL_REPORT_LEGEND}
+
+    ### 第三条 资料使用
+- **风险类型**: 商业
+- **风险等级**: 中风险
+- **企业内部风险等级：** 未检索到企业内部风险等级
+- **法律效力**: 未检索到直接依据
+- **商业后果**: 暂无直接影响资料。
+- **救济成本**: 低
+- **受影响方**: 双方
+- **结论置信度**: 低
+- **法律/合规依据**: 未检索到直接依据
+- **企业知识库依据**: 未检索到相关企业规则或知识库依据
+- **风险剖析**: 知识库无相关规则。
+- **修改建议**: 补充企业规则资料。
+"""
+
+        self.assertEqual(validate_report_structure(raw_report), [])
+        parsed = parse_structured_report(raw_report)
+        self.assertIsNotNone(parsed)
+        self.assertEqual(
+            parsed.reviews[0].enterprise_risk_level,
+            "未检索到企业内部风险等级",
         )
 
 

@@ -1,4 +1,4 @@
-"""Validate and finalize reports after the ReAct tool loop."""
+"""Finalize reports after the ReAct tool loop."""
 
 import asyncio
 import json
@@ -23,8 +23,25 @@ from .events import encode_event
 from .tool_call_recorder import ToolCallRecorder
 
 
+_ENTERPRISE_RISK_FLOORS = {
+    "high": "高风险",
+    "高": "高风险",
+    "高风险": "高风险",
+    "medium": "中风险",
+    "med": "中风险",
+    "中": "中风险",
+    "中风险": "中风险",
+    "low": "低风险",
+    "低": "低风险",
+    "低风险": "低风险",
+    "notice": "提示",
+    "提示": "提示",
+}
+_REPORT_RISK_RANK = {"提示": 0, "低风险": 1, "中风险": 2, "高风险": 3}
+
+
 class ReportFinalizer:
-    """Repair report structure and add only verified enterprise citations."""
+    """Pass through model reports without post-processing."""
 
     def __init__(self, agent: Any):
         self.agent = agent
@@ -69,7 +86,7 @@ class ReportFinalizer:
         return "".join(content_parts).strip()
 
     @staticmethod
-    def _decode_supplements(response: str) -> Dict[str, Dict[str, Any]]:
+    def _decode_payload(response: str) -> Dict[str, Any]:
         start = response.find("{")
         end = response.rfind("}")
         if start < 0 or end < start:
@@ -78,6 +95,11 @@ class ReportFinalizer:
             payload = json.loads(response[start:end + 1])
         except json.JSONDecodeError:
             return {}
+        return payload if isinstance(payload, dict) else {}
+
+    @staticmethod
+    def _decode_supplements(response: str) -> Dict[str, Dict[str, Any]]:
+        payload = ReportFinalizer._decode_payload(response)
         supplements = payload.get("supplements", []) if isinstance(payload, dict) else []
         if not isinstance(supplements, list):
             return {}
@@ -91,12 +113,133 @@ class ReportFinalizer:
         }
 
     @staticmethod
+    def _validated_rule_assessments(
+        report: str,
+        contract_text: str,
+        assessments: Any,
+        evidence: Dict[str, Dict[str, Any]],
+    ) -> tuple[Dict[str, Dict[str, Any]], list[str]]:
+        expected_ids = {
+            evidence_id
+            for evidence_id, item in evidence.items()
+            if item.get("source_type") == "enterprise_rule"
+        }
+        if not expected_ids:
+            return {}, []
+        parsed = parse_structured_report(report)
+        if not parsed:
+            return {}, ["最终报告无法解析，不能核验企业规则适用性"]
+        if not isinstance(assessments, list):
+            return {}, ["缺少 rule_assessments 数组"]
+
+        reviews = {item.clause_topic: item for item in parsed.reviews}
+        normalized_reviews: Dict[str, list[str]] = {}
+        for topic in reviews:
+            normalized_reviews.setdefault(
+                ReportFinalizer._normalize_clause_topic(topic), []
+            ).append(topic)
+
+        proposals: Dict[str, Dict[str, Any]] = {}
+        issues = []
+        seen_ids = set()
+
+        def grounded_contract_quote(value: Any) -> bool:
+            quote = re.sub(r"\s+", "", str(value or ""))
+            source = re.sub(r"\s+", "", contract_text)
+            return bool(quote) and quote in source
+
+        for assessment in assessments:
+            if not isinstance(assessment, dict):
+                issues.append("存在格式无效的企业规则核对记录")
+                continue
+            evidence_id = assessment.get("evidence_id")
+            if evidence_id not in expected_ids:
+                issues.append(f"核对记录包含未知规则编号：{evidence_id}")
+                continue
+            if evidence_id in seen_ids:
+                issues.append(f"规则 {evidence_id} 被重复核对")
+                continue
+            seen_ids.add(evidence_id)
+
+            applicability = assessment.get("applicability")
+            clauses = assessment.get("applicable_clauses")
+            if not isinstance(clauses, list):
+                issues.append(f"规则 {evidence_id} 缺少 applicable_clauses 数组")
+                continue
+            if applicability == "not_applicable":
+                if clauses or not str(assessment.get("not_applicable_reason", "")).strip():
+                    issues.append(f"规则 {evidence_id} 的不适用结论缺少理由或与适用条款冲突")
+                if not grounded_contract_quote(assessment.get("contract_basis")):
+                    issues.append(f"规则 {evidence_id} 的不适用判断没有可在合同原文中核实的引文")
+                continue
+            if applicability != "applicable" or not clauses:
+                issues.append(f"规则 {evidence_id} 未给出有效的适用结论")
+                continue
+
+            for clause in clauses:
+                if not isinstance(clause, dict):
+                    issues.append(f"规则 {evidence_id} 的适用条款记录格式无效")
+                    continue
+                topic = clause.get("clause_topic")
+                review = reviews.get(topic)
+                if review is None:
+                    matches = normalized_reviews.get(
+                        ReportFinalizer._normalize_clause_topic(str(topic or "")), []
+                    )
+                    if len(matches) == 1:
+                        topic = matches[0]
+                        review = reviews[topic]
+                if review is None:
+                    issues.append(f"规则 {evidence_id} 指向了不存在或不唯一的条款：{topic}")
+                    continue
+                required_values = (
+                    clause.get("contract_basis"),
+                    clause.get("reason"),
+                    clause.get("recommendation_for_report"),
+                )
+                if not all(str(value or "").strip() for value in required_values):
+                    issues.append(f"规则 {evidence_id} 的适用判断或建议不完整")
+                    continue
+                if not grounded_contract_quote(clause.get("contract_basis")):
+                    issues.append(f"规则 {evidence_id} 的合同依据不在合同原文中")
+                    continue
+                proposal = proposals.setdefault(topic, {
+                    "evidence_ids": [],
+                    "recommendation_adoptions": [],
+                    "rule_impacts": [],
+                })
+                proposal["evidence_ids"].append(evidence_id)
+                proposal["recommendation_adoptions"].append(
+                    str(clause["recommendation_for_report"]).strip()
+                )
+                proposal["rule_impacts"].append({
+                    "evidence_id": evidence_id,
+                    "enterprise_risk_level": evidence[evidence_id].get(
+                        "enterprise_risk_level", ""
+                    ),
+                    "contract_basis": str(clause["contract_basis"]).strip(),
+                    "reason": str(clause["reason"]).strip(),
+                })
+
+        missing_ids = expected_ids - seen_ids
+        issues.extend(f"规则 {evidence_id} 未核对" for evidence_id in sorted(missing_ids))
+        return proposals, issues
+
+    @staticmethod
     def _normalize_clause_topic(topic: str) -> str:
         return re.sub(
             r"^\s*(?:\d+(?:\.\d+)*(?:[.、)]?\s*)|第[一二三四五六七八九十百千万零〇两\d]+条\s*)",
             "",
             topic,
         ).strip()
+
+    @staticmethod
+    def _without_report_risk_levels(report: str) -> str:
+        return "\n".join(
+            line for line in report.splitlines()
+            if "**风险等级**" not in line
+            and "**企业内部风险等级" not in line
+        )
 
     @staticmethod
     def _validated_supplements(
@@ -157,13 +300,61 @@ class ReportFinalizer:
             ))
             if grades:
                 values["enterprise_risk_level"] = "、".join(grades)
-            if any(
-                record.get("source_type") == "enterprise_rule"
-                and str(record.get("enterprise_risk_level", "")).strip().casefold()
-                in {"high", "高", "高风险"}
+            recommendations = [
+                str(item).strip()
+                for item in suggestion.get("recommendation_adoptions", [])
+                if str(item).strip()
+            ]
+            if recommendations:
+                existing_recommendation = str(review.suggested_revision or "").strip()
+                values["suggested_revision"] = "\n".join(dict.fromkeys(
+                    ([existing_recommendation] if existing_recommendation else [])
+                    + [f"企业规则建议：{item}" for item in recommendations]
+                ))
+            rule_impacts = suggestion.get("rule_impacts", [])
+            applicable_floors = [
+                floor
                 for _, record in records
-            ):
-                values["risk_level"] = "高风险"
+                if record.get("source_type") == "enterprise_rule"
+                and (floor := _ENTERPRISE_RISK_FLOORS.get(
+                    str(record.get("enterprise_risk_level", "")).strip().casefold()
+                ))
+            ]
+            if isinstance(rule_impacts, list) and rule_impacts:
+                impact_notes = []
+                for impact in rule_impacts:
+                    if not isinstance(impact, dict):
+                        continue
+                    evidence_id = impact.get("evidence_id")
+                    record = evidence.get(evidence_id, {})
+                    raw_grade = str(
+                        record.get("enterprise_risk_level")
+                        or impact.get("enterprise_risk_level")
+                        or ""
+                    ).strip()
+                    impact_notes.append(
+                        f"{evidence_id}（企业内部等级：{raw_grade or '未提供'}）："
+                        f"{impact.get('contract_basis', '')}；{impact.get('reason', '')}"
+                    )
+                if impact_notes:
+                    existing_issue = str(review.issue or "").strip()
+                    values["issue"] = "\n".join(dict.fromkeys(
+                        ([existing_issue] if existing_issue else [])
+                        + ["企业规则核对：" + note for note in impact_notes]
+                    ))
+            current_risk = getattr(review.risk_level, "value", review.risk_level)
+            current_risk = _ENTERPRISE_RISK_FLOORS.get(
+                str(current_risk).strip().casefold(),
+                str(current_risk).strip(),
+            )
+            if applicable_floors:
+                floor = max(
+                    applicable_floors,
+                    key=lambda risk: _REPORT_RISK_RANK[risk],
+                )
+                current_rank = _REPORT_RISK_RANK.get(current_risk, -1)
+                if _REPORT_RISK_RANK[floor] > current_rank:
+                    values["risk_level"] = floor
             if values:
                 supplements[topic] = values
         return supplements
@@ -178,159 +369,38 @@ class ReportFinalizer:
         finish_reason: str | None,
         tool_call_records: ToolCallRecorder,
     ) -> AsyncGenerator[Dict[str, str], None]:
-        final_text = report
-        evidence = tool_call_records.evidence_records()
+        call_count = len(tool_call_records.snapshot()["calls"])
         yield encode_event("pipeline_stage", {
             "task_id": task_id,
             "stage": "format_validation",
-            "status": "started",
-            "message": "正在校验最终报告结构",
+            "status": "skipped",
+            "message": "已关闭报告格式校验，直接采用大模型原始输出",
+            "count": 0,
         })
-        format_issues = validate_report_structure(final_text)
-        repair_instructions = list(format_issues)
-        original_placeholder_count = final_text.count("初稿未提供")
-        if original_placeholder_count:
-            repair_instructions.append(
-                "尝试从同一条款初稿的其他段落归位已明确的信息，减少普通字段中的‘初稿未提供’；不得推断"
-            )
-        format_status = "completed"
-        format_message = "最终报告结构校验通过"
-        try:
-            repaired = await self._generate_text(
-                REPORT_FORMAT_REPAIR_PROMPT,
-                json.dumps({"format_issues": repair_instructions, "report": final_text}, ensure_ascii=False),
-                AGENT_CONFIG.get(
-                    "report_format_max_tokens",
-                    min(4096, max(1024, AGENT_CONFIG.get("max_context_tokens", 8192) // 2)),
-                ),
-            )
-            repaired_issues = validate_report_structure(repaired) if repaired else format_issues
-            improved = (
-                len(repaired_issues) < len(format_issues)
-                or (
-                    repaired.count("初稿未提供") < original_placeholder_count
-                    and len(repaired_issues) <= len(format_issues)
-                )
-            )
-            if repaired and (not repaired_issues or improved):
-                final_text = repaired
-                format_message = (
-                    "模型已校验最终报告格式"
-                    if not format_issues
-                    else "格式问题已由模型修复并复核"
-                )
-            elif format_issues:
-                format_status = "failed"
-                format_message = "模型未能修复全部格式问题，保留原报告并继续"
-            else:
-                format_message = "模型校验未改善已合格报告，保留原报告"
-        except Exception as exc:
-            format_status = "failed"
-            format_message = f"格式复核模型调用失败，保留原报告并继续：{exc}"
-        final_text = normalize_report_structure(final_text) or final_text
-        yield encode_event("pipeline_stage", {
-            "task_id": task_id,
-            "stage": "format_validation",
-            "status": format_status,
-            "message": format_message,
-            "count": len(validate_report_structure(final_text)),
-        })
-
-        enterprise_evidence = {
-            evidence_id: item
-            for evidence_id, item in evidence.items()
-            if item.get("source_type") in {"enterprise_document", "enterprise_rule"}
-        }
-        parsed_report = parse_structured_report(final_text)
-        clauses_to_reconcile = [
-            item.clause_topic
-            for item in (parsed_report.reviews if parsed_report else [])
-        ] if enterprise_evidence else []
         yield encode_event("pipeline_stage", {
             "task_id": task_id,
             "stage": "report_reconciliation",
-            "status": "started",
-            "message": "正在依据工具调用记录复核风险等级和企业知识库依据",
-            "count": len(tool_call_records.snapshot()["calls"]),
-        })
-        applied = {}
-        supplement_status = "skipped"
-        supplement_message = "没有待补充条款或企业知识库命中"
-        if enterprise_evidence and clauses_to_reconcile:
-            evidence_payload = [
-                {
-                    "id": evidence_id,
-                    "source_type": item.get("source_type"),
-                    "source_location": item.get("source_location") or item.get("source_path") or item.get("doc_name"),
-                    "title": item.get("title"),
-                    "enterprise_risk_level": item.get("enterprise_risk_level"),
-                    "text": str(item.get("text") or "")[:1600],
-                }
-                for evidence_id, item in list(enterprise_evidence.items())[:20]
-            ]
-            try:
-                response = await self._generate_text(
-                    KNOWLEDGE_EVIDENCE_SUPPLEMENT_PROMPT,
-                    json.dumps({
-                        "contract_text": contract_text,
-                        "report": final_text,
-                        "enterprise_evidence": evidence_payload,
-                        "tool_call_records": [
-                            {
-                                "turn": call["turn"],
-                                "tool": call["tool"],
-                                "arguments": call["arguments"],
-                                "success": call["success"],
-                                "evidence_ids": [
-                                    item["id"] for item in call["evidence"]
-                                ],
-                            }
-                            for call in tool_call_records.snapshot()["calls"]
-                            if call["tool"] != "submit_final_report"
-                        ],
-                    }, ensure_ascii=False),
-                    AGENT_CONFIG.get("knowledge_supplement_max_tokens", 512),
-                )
-                applied = self._validated_supplements(
-                    final_text,
-                    self._decode_supplements(response),
-                    enterprise_evidence,
-                )
-                if applied:
-                    final_text = normalize_report_structure(
-                        final_text, evidence_supplements=applied
-                    ) or final_text
-                    supplement_message = "已补充并核验相关企业知识库来源"
-                else:
-                    supplement_message = "本次命中资料未能匹配到需要补充的条款"
-                supplement_status = "completed"
-            except Exception as exc:
-                supplement_status = "failed"
-                supplement_message = f"知识库补充失败，保留格式校验后的报告：{exc}"
-        yield encode_event("pipeline_stage", {
-            "task_id": task_id,
-            "stage": "report_reconciliation",
-            "status": supplement_status,
-            "message": supplement_message,
-            "count": len(applied),
+            "status": "skipped",
+            "message": "已关闭企业规则核验和报告补写，直接采用大模型输出",
+            "count": call_count,
         })
         yield encode_event("pipeline_stage", {
             "task_id": task_id,
             "stage": "review_complete",
             "status": "completed",
-            "message": "审查收尾流水线完成",
+            "message": "已接收大模型报告输出",
         })
         tool_call_records.finish("success")
         yield encode_event("pipeline_stage", {
             "task_id": task_id,
             "stage": "tool_recording",
             "status": "completed",
-            "message": "工具调用记录已用于报告复核",
-            "count": len(tool_call_records.snapshot()["calls"]),
+            "message": "工具调用记录已保留",
+            "count": call_count,
         })
         yield encode_event("final_report", {
             "task_id": task_id,
-            "raw_report": final_text,
+            "raw_report": report,
             "turns": turn,
             "is_complete": True,
             "status": "success",

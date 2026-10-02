@@ -4,8 +4,11 @@ import asyncio
 import json
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from configs import config as app_config
 from gateway.llm_interaction.context_manager import ContextWindowManager
+from gateway.llm_interaction.react_loop import _max_output_tokens
 from gateway.llm_interaction.contracts import ModelToolCall
 from gateway.llm_interaction.events import encode_event
 from gateway.llm_interaction.final_report import (
@@ -20,6 +23,9 @@ from gateway.llm_interaction.tool_catalog import build_tool_schemas
 from gateway.llm_interaction.tool_executor import ToolExecutor
 from gateway.llm_interaction.tool_call_recorder import ToolCallRecorder
 from core.prompts import (
+    AGENT_SYSTEM_PROMPT,
+    EMPTY_SEARCH_RETRY_PROMPT,
+    FINAL_CONSISTENCY_CHECK_PROMPT,
     REPORT_OUTPUT_GUIDANCE,
     REVIEW_ANALYSIS_GUIDANCE,
     RISK_LEVEL_REPORT_LEGEND,
@@ -211,6 +217,33 @@ class ToolContractTests(unittest.TestCase):
             validate_final_report(call, ["unlimited_liability"])
 
 class ContextAndGuardrailTests(unittest.TestCase):
+    def test_qwen_1_5b_budget_matches_its_context_and_output_ceiling(self):
+        model_context = app_config.MODEL_PRESETS["qwen2.5-1.5b-awq"]["max_model_len"]
+        requested_output = app_config.AGENT_CONFIG["max_tokens"]
+        actual_output = _max_output_tokens(model_context, requested_output)
+
+        context = ContextWindowManager(
+            "unknown-model",
+            max_context_tokens=model_context,
+            output_tokens=actual_output,
+        )
+        self.assertEqual(
+            context._max_input_tokens,
+            int(model_context * 0.98) - actual_output,
+        )
+        self.assertEqual(_max_output_tokens(32768, 8192), 8192)
+        self.assertEqual(_max_output_tokens(8192, 8192), 2048)
+        self.assertEqual(_max_output_tokens(4096, 8192), 1024)
+
+    def test_context_budget_leaves_two_percent_for_runtime_overhead(self):
+        context = ContextWindowManager(
+            "unknown-model",
+            max_context_tokens=8192,
+            output_tokens=2048,
+        )
+
+        self.assertEqual(context._max_input_tokens, 5980)
+
     def test_context_window_drops_complete_old_tool_turns(self):
         context = ContextWindowManager(
             "unknown-model",
@@ -230,6 +263,71 @@ class ContextAndGuardrailTests(unittest.TestCase):
         self.assertEqual([item.get("tool_call_id") for item in fitted if item["role"] == "tool"], ["new"])
         self.assertEqual(fitted[:2], messages[:2])
 
+    def test_context_window_preserves_enterprise_evidence_after_duplicate_searches(self):
+        context = ContextWindowManager(
+            "unknown-model",
+            max_context_tokens=8192,
+            output_tokens=512,
+            max_history_turns=4,
+        )
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "contract"},
+        ]
+
+        def append_tool_turn(call_id, tool_name, observation):
+            messages.extend([
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "function": {"name": tool_name},
+                    }],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "name": tool_name,
+                    "content": json.dumps(observation),
+                },
+            ])
+
+        append_tool_turn("law", "search_civil_code", {
+            "evidence": [{"id": "LAW_OLD", "source_type": "law"}],
+        })
+        append_tool_turn("company", "get_company_policy", {
+            "evidence": [
+                {"id": "DOC1", "source_type": "enterprise_document"},
+                {"id": "RULE2", "source_type": "enterprise_rule"},
+            ],
+        })
+        append_tool_turn("rules", "get_past_review_rules", {
+            "evidence": [{"id": "RULE2", "source_type": "enterprise_rule"}],
+        })
+        append_tool_turn("general", "search_general_materials", {"evidence": []})
+        for call_id in ("duplicate1", "duplicate2", "duplicate3"):
+            append_tool_turn(call_id, "search_civil_code", {
+                "ok": False,
+                "error": "重复检索",
+            })
+
+        fitted = context.fit_messages(messages, [])
+        tool_content = "\n".join(
+            message["content"]
+            for message in fitted
+            if message["role"] == "tool"
+        )
+
+        self.assertIn("RULE2", tool_content)
+        self.assertIn("DOC1", tool_content)
+        self.assertNotIn("LAW_OLD", tool_content)
+        self.assertIn("duplicate3", [
+            message.get("tool_call_id")
+            for message in fitted
+            if message["role"] == "tool"
+        ])
+
     def test_deterministic_financial_flags(self):
         findings = detect_contract_flags(
             "甲方每日按总价0.1%支付逾期金。乙方每日按总价1.2%支付违约金。"
@@ -242,6 +340,19 @@ class ContextAndGuardrailTests(unittest.TestCase):
 
 
 class PromptAlignmentTests(unittest.TestCase):
+    def test_prompts_forbid_fallback_to_pretrained_knowledge(self):
+        messages = build_review_messages("合同正文", "neutral", [])
+        prompts = (
+            messages[0]["content"],
+            AGENT_SYSTEM_PROMPT,
+            FINAL_CONSISTENCY_CHECK_PROMPT,
+            EMPTY_SEARCH_RETRY_PROMPT,
+        )
+        for prompt in prompts:
+            self.assertIn("知识库", prompt)
+            self.assertRegex(prompt, r"不得.{0,12}(?:模型记忆|预训练记忆|专业常识)")
+        self.assertNotIn("直接使用模型已有法律知识", EMPTY_SEARCH_RETRY_PROMPT)
+
     def test_native_prompt_includes_shared_review_requirements(self):
         messages = build_review_messages("第一条 合同期限", "buyer", [])
         system_prompt = messages[0]["content"]
@@ -249,7 +360,8 @@ class PromptAlignmentTests(unittest.TestCase):
         self.assertIn(REVIEW_ANALYSIS_GUIDANCE, system_prompt)
         self.assertIn(REPORT_OUTPUT_GUIDANCE, system_prompt)
         self.assertIn("逾期 30 日", system_prompt)
-        self.assertIn("按规则的风险等级、审查标准和禁止情形逐项核对", system_prompt)
+        self.assertIn("违反规则应报告为风险，不能因此判为不适用", system_prompt)
+        self.assertIn("不得写成“未检索到相关企业规则”", system_prompt)
         self.assertIn("[[EVIDENCE:EV编号]]", system_prompt)
         self.assertIn("submit_final_report", system_prompt)
         self.assertIn("不得填写工具名", system_prompt)
@@ -258,6 +370,163 @@ class PromptAlignmentTests(unittest.TestCase):
 
 
 class ReActLoopTests(unittest.TestCase):
+    def test_enterprise_rule_assessments_require_complete_coverage(self):
+        report = f"""{RISK_LEVEL_REPORT_LEGEND}
+
+    ### 第二条 付款条件
+    - **风险类型**: 商业
+    - **风险等级**: 中风险
+    - **企业内部风险等级**: 未检索到企业内部风险等级
+    - **法律效力**: 未检索到直接依据
+    - **商业后果**: 付款期限不明确可能导致结算延迟。
+    - **救济成本**: 中
+    - **受影响方**: 乙方
+    - **结论置信度**: 中
+    - **法律/合规依据**: 未检索到直接依据
+    - **企业知识库依据**: 未检索到相关企业规则或知识库依据
+    - **风险剖析**: 付款期限需要明确。
+    - **修改建议**: 明确付款期限。
+    """
+        evidence = {
+            "RULE_MEDIUM": {
+                "source_type": "enterprise_rule",
+                "enterprise_risk_level": "Medium",
+            },
+            "RULE_LOW": {
+                "source_type": "enterprise_rule",
+                "enterprise_risk_level": "Low",
+            },
+        }
+        assessments = [
+            {
+                "evidence_id": "RULE_MEDIUM",
+                "applicability": "applicable",
+                "applicable_clauses": [{
+                    "clause_topic": "第二条 付款条件",
+                    "contract_basis": "验收后 60 个工作日付款",
+                    "reason": "超过规则允许的付款周期。",
+                    "recommendation_for_report": "将付款周期改为 30 个工作日内。",
+                }],
+            },
+            {
+                "evidence_id": "RULE_LOW",
+                "applicability": "not_applicable",
+                "applicable_clauses": [],
+                "contract_basis": "验收后 60 个工作日付款",
+                "not_applicable_reason": "合同没有涉及该规则约束的事项。",
+            },
+        ]
+
+        proposals, issues = ReportFinalizer._validated_rule_assessments(
+            report, "验收后 60 个工作日付款", assessments, evidence
+        )
+        self.assertEqual(issues, [])
+        self.assertEqual(
+            proposals["第二条 付款条件"]["evidence_ids"],
+            ["RULE_MEDIUM"],
+        )
+        self.assertEqual(
+            proposals["第二条 付款条件"]["recommendation_adoptions"],
+            ["将付款周期改为 30 个工作日内。"],
+        )
+        self.assertEqual(
+            proposals["第二条 付款条件"]["rule_impacts"][0]["enterprise_risk_level"],
+            "Medium",
+        )
+
+        _, missing_issues = ReportFinalizer._validated_rule_assessments(
+            report, "验收后 60 个工作日付款", assessments[:1], evidence
+        )
+        self.assertIn("规则 RULE_LOW 未核对", missing_issues)
+
+        unsupported = [dict(assessments[1], contract_basis="验收后 15 个工作日付款")]
+        _, unsupported_issues = ReportFinalizer._validated_rule_assessments(
+            report, "验收后 60 个工作日付款", unsupported, {"RULE_LOW": evidence["RULE_LOW"]}
+        )
+        self.assertIn("不适用判断没有可在合同原文中核实的引文", unsupported_issues[0])
+
+    def test_applicable_enterprise_risk_grade_sets_non_downgrading_floor(self):
+        report = f"""{RISK_LEVEL_REPORT_LEGEND}
+
+### 第二条 付款条件
+- **风险类型**: 商业
+- **风险等级**: 低风险
+- **企业内部风险等级**: 未检索到企业内部风险等级
+- **法律效力**: 未检索到直接依据
+- **商业后果**: 付款期限不明确。
+- **救济成本**: 低
+- **受影响方**: 乙方
+- **结论置信度**: 中
+- **法律/合规依据**: 未检索到直接依据
+- **企业知识库依据**: 未检索到相关企业规则或知识库依据
+- **风险剖析**: 付款期限需要明确。
+- **修改建议**: 明确付款期限。
+"""
+        expected_floors = {
+            "High": "高风险",
+            "Medium": "中风险",
+            "Low": "低风险",
+            "Notice": "提示",
+        }
+        for evidence_id, (enterprise_grade, expected_risk) in enumerate(
+            expected_floors.items(), start=1
+        ):
+            rule_id = f"RULE{evidence_id}"
+            evidence = {
+                rule_id: {
+                    "source_type": "enterprise_rule",
+                    "source_location": f"rules.db · {rule_id}",
+                    "enterprise_risk_level": enterprise_grade,
+                }
+            }
+            applied = ReportFinalizer._validated_supplements(
+                report,
+                {"第二条 付款条件": {
+                    "evidence_ids": [rule_id],
+                    "rule_impacts": [{
+                        "evidence_id": rule_id,
+                        "enterprise_risk_level": enterprise_grade,
+                        "contract_basis": "验收后 60 个工作日付款",
+                        "reason": "超过企业规则规定的付款周期。",
+                    }],
+                    "recommendation_adoptions": ["改为 30 个工作日内付款。"],
+                }},
+                evidence,
+            )
+            if expected_risk in {"高风险", "中风险"}:
+                self.assertEqual(
+                    applied["第二条 付款条件"]["risk_level"],
+                    expected_risk,
+                )
+            else:
+                self.assertNotIn("risk_level", applied["第二条 付款条件"])
+            self.assertIn(
+                "企业规则核对：",
+                applied["第二条 付款条件"]["issue"],
+            )
+
+        high_report = report.replace("- **风险等级**: 低风险", "- **风险等级**: 高风险")
+        low_rule = {
+            "RULE_LOW": {
+                "source_type": "enterprise_rule",
+                "enterprise_risk_level": "Low",
+            }
+        }
+        preserved = ReportFinalizer._validated_supplements(
+            high_report,
+            {"第二条 付款条件": {
+                "evidence_ids": ["RULE_LOW"],
+                "rule_impacts": [{
+                    "evidence_id": "RULE_LOW",
+                    "enterprise_risk_level": "Low",
+                    "contract_basis": "合同事实",
+                    "reason": "规则适用。",
+                }],
+            }},
+            low_rule,
+        )
+        self.assertNotIn("risk_level", preserved["第二条 付款条件"])
+
     def test_applicable_high_enterprise_rule_forces_high_risk(self):
         report = """### 第二条 付款条件
 - **风险等级**: 低风险
@@ -301,7 +570,7 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(applicable["第二条 付款条件"]["enterprise_risk_level"], "High")
         self.assertNotIn("第二条 付款条件", unrelated)
 
-    def test_finalizer_always_validates_a_structurally_valid_report(self):
+    def test_finalizer_passes_through_report_without_validation(self):
         report = f"""{RISK_LEVEL_REPORT_LEGEND}
 
 ### 第五条 服务保障
@@ -318,9 +587,7 @@ class ReActLoopTests(unittest.TestCase):
 - **风险剖析**: 验收期限未明确，付款条件可能长期无法触发。
 - **修改建议**: 明确验收期限和逾期未反馈的处理方式。
 """
-        agent, requests = _agent(iter([
-            [_chunk(content=report, finish_reason="stop")],
-        ]))
+        agent, requests = _agent(iter([]))
         recorder = ToolCallRecorder("valid-report-format-check")
 
         async def collect():
@@ -334,16 +601,169 @@ class ReActLoopTests(unittest.TestCase):
                 tool_call_records=recorder,
             )]
 
+        with patch.dict(app_config.AGENT_CONFIG, {"report_format_repair_enabled": False}):
+            events = asyncio.run(collect())
+        final = next(
+            json.loads(event["data"])
+            for event in events
+            if event["event"] == "final_report"
+        )
+        self.assertEqual(requests, [])
+        format_stage = next(
+            json.loads(event["data"])
+            for event in events
+            if event["event"] == "pipeline_stage"
+            and json.loads(event["data"])["stage"] == "format_validation"
+            and json.loads(event["data"])["status"] == "skipped"
+        )
+        self.assertIn("直接采用大模型原始输出", format_stage["message"])
+        self.assertEqual(final["status"], "success")
+        self.assertEqual(final["raw_report"], report)
+        self.assertEqual(requests, [])
+
+    def test_finalizer_passes_through_report_without_rule_assessments(self):
+        report = f"""{RISK_LEVEL_REPORT_LEGEND}
+
+### 第二条 付款条件
+- **风险类型**: 商业
+- **风险等级**: 中风险
+- **企业内部风险等级**: 未检索到企业内部风险等级
+- **法律效力**: 未检索到直接依据
+- **商业后果**: 付款期限不明确可能导致结算延迟。
+- **救济成本**: 中
+- **受影响方**: 乙方
+- **结论置信度**: 中
+- **法律/合规依据**: 未检索到直接依据
+- **企业知识库依据**: 未检索到相关企业规则或知识库依据
+- **风险剖析**: 付款期限需要明确。
+- **修改建议**: 明确付款期限。
+"""
+        missing_assessment = json.dumps({
+            "rule_assessments": [],
+            "supplements": [],
+        }, ensure_ascii=False)
+        agent, requests = _agent(iter([
+            [_chunk(content=missing_assessment, finish_reason="stop")],
+            [_chunk(content=missing_assessment, finish_reason="stop")],
+        ]))
+        recorder = ToolCallRecorder("missing-rule-assessment")
+        recorder.record_call(1, "call_rule", "get_past_review_rules", "{\"query\":\"付款期限\"}")
+        recorder.record_result(
+            "call_rule",
+            json.dumps({"evidence": [{
+                "id": "RULE2",
+                "source_type": "enterprise_rule",
+                "enterprise_risk_level": "Medium",
+                "source_location": "data/rule_book.db · 规则 RULE2",
+                "text": "付款周期不得超过 30 个工作日。",
+            }]}),
+            True,
+            0,
+        )
+
+        async def collect():
+            return [event async for event in ReportFinalizer(agent).finalize(
+                report=report,
+                contract_text="验收合格后 60 个工作日付款。",
+                task_id="第二条 付款条件",
+                turn=2,
+                acknowledged_guardrails=[],
+                finish_reason="tool_calls",
+                tool_call_records=recorder,
+            )]
+
         events = asyncio.run(collect())
         final = next(
             json.loads(event["data"])
             for event in events
             if event["event"] == "final_report"
         )
-        self.assertEqual(len(requests), 1)
-        self.assertIn("完整 Markdown", requests[0]["messages"][0]["content"])
+        self.assertFalse(any(event["event"] == "rule_assessment" for event in events))
+        self.assertEqual(final["raw_report"], report)
         self.assertEqual(final["status"], "success")
-        self.assertIn("### 第五条 服务保障", final["raw_report"])
+        self.assertTrue(final["is_complete"])
+        self.assertEqual(recorder.status, "success")
+        self.assertEqual(requests, [])
+
+    def test_finalizer_does_not_reconcile_enterprise_rule_assessments(self):
+        report = f"""{RISK_LEVEL_REPORT_LEGEND}
+
+### 第二条 付款条件
+- **风险类型**: 商业
+- **风险等级**: 低风险
+- **企业内部风险等级**: 未检索到企业内部风险等级
+- **法律效力**: 未检索到直接依据
+- **商业后果**: 付款条件存在不确定性。
+- **救济成本**: 中
+- **受影响方**: 乙方
+- **结论置信度**: 中
+- **法律/合规依据**: 未检索到直接依据
+- **企业知识库依据**: 未检索到相关企业规则或知识库依据
+- **风险剖析**: 尾款付款时间由甲方资金情况决定。
+- **修改建议**: 明确尾款支付期限。
+"""
+        contract_text = "甲方按季度资金周转充裕情况安排支付尾款，且付款期限不受商业惯例限制。"
+        first_assessment = json.dumps({
+            "rule_assessments": [{
+                "evidence_id": "RULE2",
+                "applicability": "applicable",
+                "applicable_clauses": [{
+                    "clause_topic": "付款条件与结算周期",
+                    "contract_basis": "甲方按季度资金周转充裕情况安排支付尾款",
+                    "reason": "付款安排取决于甲方资金情况，属于规则禁止的主观条件。",
+                    "recommendation_for_report": "约定验收后固定期限内支付尾款。",
+                }],
+            }],
+            "supplements": [],
+        }, ensure_ascii=False)
+        contradictory_retry = json.dumps({
+            "rule_assessments": [{
+                "evidence_id": "RULE2",
+                "applicability": "not_applicable",
+                "applicable_clauses": [],
+                "contract_basis": "验收合格后的15个工作日内支付尾款",
+                "not_applicable_reason": "合同已明确验收后的付款期限。",
+            }],
+            "supplements": [],
+        }, ensure_ascii=False)
+        agent, requests = _agent(iter([]))
+        recorder = ToolCallRecorder("contradictory-rule-assessment")
+        recorder.record_call(1, "call_rule", "get_past_review_rules", "{}");
+        recorder.record_result(
+            "call_rule",
+            json.dumps({"evidence": [{
+                "id": "RULE2",
+                "source_type": "enterprise_rule",
+                "enterprise_risk_level": "High",
+                "source_location": "data/rule_book.db · 规则 RULE2",
+                "text": "禁止视甲方资金情况安排付款。",
+            }]}),
+            True,
+            0,
+        )
+
+        async def collect():
+            return [event async for event in ReportFinalizer(agent).finalize(
+                report=report,
+                contract_text=contract_text,
+                task_id="第二条 付款条件",
+                turn=2,
+                acknowledged_guardrails=[],
+                finish_reason="tool_calls",
+                tool_call_records=recorder,
+            )]
+
+        events = asyncio.run(collect())
+        final = next(
+            json.loads(event["data"])
+            for event in events
+            if event["event"] == "final_report"
+        )
+        self.assertFalse(any(event["event"] == "rule_assessment" for event in events))
+        self.assertEqual(final["raw_report"], report)
+        self.assertEqual(final["status"], "success")
+        self.assertTrue(final["is_complete"])
+        self.assertEqual(requests, [])
 
     def test_finalizer_retries_existing_placeholder_fields(self):
         report = f"""{RISK_LEVEL_REPORT_LEGEND}
@@ -366,9 +786,7 @@ class ReActLoopTests(unittest.TestCase):
             "- **风险类型**: 初稿未提供",
             "- **风险类型**: 商业",
         )
-        agent, requests = _agent(iter([
-            [_chunk(content=repaired_report, finish_reason="stop")],
-        ]))
+        agent, requests = _agent(iter([]))
         recorder = ToolCallRecorder("placeholder-repair")
 
         async def collect():
@@ -382,15 +800,16 @@ class ReActLoopTests(unittest.TestCase):
                 tool_call_records=recorder,
             )]
 
-        events = asyncio.run(collect())
+        with patch.dict(app_config.AGENT_CONFIG, {"report_format_repair_enabled": True}):
+            events = asyncio.run(collect())
         final = next(
             json.loads(event["data"])
             for event in events
             if event["event"] == "final_report"
         )
-        self.assertNotIn("初稿未提供", final["raw_report"])
-        self.assertIn("- **风险类型**: 商业", final["raw_report"])
-        self.assertIn("初稿未提供", requests[0]["messages"][0]["content"])
+        self.assertEqual(final["raw_report"], report)
+        self.assertIn("初稿未提供", final["raw_report"])
+        self.assertEqual(requests, [])
 
     def test_native_tool_call_returns_role_tool_then_structured_final(self):
         report = "建议明确付款期限。"
@@ -497,24 +916,8 @@ class ReActLoopTests(unittest.TestCase):
             },
         )
 
-    def test_finalization_captures_and_supplements_enterprise_evidence(self):
+    def test_finalization_preserves_model_report_with_enterprise_evidence(self):
         report = "### 8.2 仲裁管辖约定\n- **风险等级**: 中风险"
-        formatted_report = f"""{RISK_LEVEL_REPORT_LEGEND}
-
-    ### 8.2 仲裁管辖约定
-- **风险类型**: 商业
-- **风险等级**: 中风险
-- **企业内部风险等级**: Low
-- **法律效力**: 未检索到直接依据
-- **商业后果**: 可能增加争议处理成本。
-- **救济成本**: 中
-- **受影响方**: 双方
-- **结论置信度**: 中
-- **法律/合规依据**: 未检索到直接依据
-- **企业知识库依据**: stale.db · 规则 OLD [[RULE:OLD]]
-- **风险剖析**: 仲裁员选任方式需核实。
-- **修改建议**: 明确仲裁员选任方式。
-"""
         rule_evidence = {
             "evidence": [{
                 "id": "RULE3",
@@ -541,14 +944,6 @@ class ReActLoopTests(unittest.TestCase):
                     "acknowledged_guardrails": [],
                 }, ensure_ascii=False),
             )], finish_reason="tool_calls")],
-            [_chunk(content=formatted_report, finish_reason="stop")],
-            [_chunk(content=json.dumps({
-                "supplements": [{
-                    "clause_topic": "8.2 仲裁管辖约定",
-                    "evidence_ids": ["RULE3"],
-                    "raise_to_high_risk": True,
-                }],
-            }, ensure_ascii=False), finish_reason="stop")],
         ])
         agent, requests = _agent(
             responses,
@@ -562,7 +957,8 @@ class ReActLoopTests(unittest.TestCase):
                 "8.2 甲方单方指定独任仲裁员", 3, "supplement"
             )]
 
-        events = asyncio.run(collect())
+        with patch.dict(app_config.AGENT_CONFIG, {"report_format_repair_enabled": True}):
+            events = asyncio.run(collect())
         payloads = [json.loads(item["data"]) for item in events]
         tool_result = next(
             payload for item, payload in zip(events, payloads)
@@ -572,18 +968,15 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(tool_result["risk_evidence_ids"], ["RULE3"])
         self.assertEqual(tool_result["enterprise_risk_levels"], {"RULE3": "High"})
         self.assertEqual(tool_result["high_risk_evidence_ids"], ["RULE3"])
-        self.assertIn(
-            "纳入对应风险等级的审查处置路径",
-            requests[1]["messages"][-1]["content"],
-        )
-        self.assertIn("High", requests[1]["messages"][-1]["content"])
+        self.assertNotIn("纳入对应风险等级的审查处置路径", requests[1]["messages"][-1]["content"])
+        self.assertNotIn("High", requests[1]["messages"][-1]["content"])
         self.assertEqual(
             [payload["stage"] for item, payload in zip(events, payloads)
              if item["event"] == "pipeline_stage"],
             [
                 "tool_recording",
-                "format_validation", "format_validation",
-                "report_reconciliation", "report_reconciliation",
+                "format_validation",
+                "report_reconciliation",
                 "review_complete", "tool_recording",
             ],
         )
@@ -591,16 +984,10 @@ class ReActLoopTests(unittest.TestCase):
             payload for item, payload in zip(events, payloads)
             if item["event"] == "final_report"
         )
-        self.assertIn("High", final["raw_report"])
-        self.assertIn("- **风险等级**: 高风险", final["raw_report"])
-        self.assertIn("data/rule_book.db · 规则 RULE3 [[RULE:RULE3]]", final["raw_report"])
-        supplement_input = json.loads(requests[3]["messages"][1]["content"])
-        self.assertEqual(supplement_input["tool_call_records"][0]["tool"], "get_company_policy")
-        self.assertEqual(supplement_input["tool_call_records"][0]["evidence_ids"], ["RULE3"])
-        self.assertTrue(supplement_input["tool_call_records"][0]["success"])
-        self.assertEqual(len(requests), 4)
+        self.assertEqual(final["raw_report"], report)
+        self.assertEqual(len(requests), 2)
 
-    def test_requires_each_available_read_tool_before_final_report(self):
+    def test_final_report_request_pins_enterprise_rule_evidence(self):
         tool_names = [
             "search_civil_code",
             "get_company_policy",
@@ -621,6 +1008,24 @@ class ReActLoopTests(unittest.TestCase):
             name: (lambda query: json.dumps({"evidence": []}))
             for name in tool_names
         }
+        mapping["get_company_policy"] = lambda query: json.dumps({
+            "evidence": [
+                {
+                    "id": "KB_LONG",
+                    "source_type": "enterprise_document",
+                    "title": "企业审查偏好",
+                    "source_location": "data/enterprise.md",
+                    "text": "长篇企业文档内容。" * 90,
+                },
+                {
+                    "id": "RULE3",
+                    "source_type": "enterprise_rule",
+                    "title": "争议管辖与仲裁机构",
+                    "source_location": "data/rule_book.db · 规则 RULE3",
+                    "text": "禁止由对方单方指定独任仲裁员在其办公室内仲裁。",
+                },
+            ],
+        }, ensure_ascii=False)
         agent, requests = _agent(responses, mapping)
 
         async def collect():
@@ -628,16 +1033,30 @@ class ReActLoopTests(unittest.TestCase):
                 "仲裁条款", 1, "required-tools"
             )]
 
-        events = asyncio.run(collect())
+        with patch.dict(app_config.AGENT_CONFIG, {"report_format_repair_enabled": True}):
+            events = asyncio.run(collect())
         forced_names = [
             request["tool_choice"]["function"]["name"]
             for request in requests[:len(tool_names)]
         ]
         self.assertEqual(forced_names, tool_names)
-        self.assertTrue(json.loads(events[-2]["data"])["is_complete"])
-        self.assertEqual(json.loads(events[-2]["data"])["turns"], 5)
-        self.assertEqual(len(requests), 6)
-        self.assertIn("格式修复器", requests[-1]["messages"][0]["content"])
+        final_event = next(
+            (event for event in events if event["event"] == "final_report"),
+            None,
+        )
+        self.assertIsNotNone(
+            final_event,
+            json.dumps([event["data"] for event in events[-3:]], ensure_ascii=False),
+        )
+        final = json.loads(final_event["data"])
+        self.assertTrue(final["is_complete"])
+        self.assertEqual(final["turns"], 5)
+        self.assertEqual(len(requests), 5)
+        final_evidence_prompt = requests[-1]["messages"][-1]["content"]
+        self.assertEqual(requests[-1]["messages"][-1]["role"], "user")
+        self.assertIn("RULE3", final_evidence_prompt)
+        self.assertIn("[[RULE:RULE3]]", final_evidence_prompt)
+        self.assertIn("禁止由对方单方指定独任仲裁员", final_evidence_prompt)
 
     def test_rejects_final_report_until_each_read_tool_has_been_called(self):
         tool_names = [

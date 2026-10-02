@@ -124,7 +124,7 @@ def validate_report_structure(raw_text: str) -> list[str]:
         missing_fields = []
         for label, pattern in REPORT_FIELD_PATTERNS:
             match = re.search(
-                rf"(?im)^\s*(?:#{{1,6}}\s*)?[-*+]??\s*(?:\*\*)?(?:{pattern})(?:\*\*)?\s*[:：]",
+                rf"(?im)^\s*(?:#{{1,6}}\s*)?[-*+]??\s*(?:\*\*)?(?:{pattern})(?:\*\*\s*[:：]|\s*[:：]\s*(?:\*\*)|\s*[:：])\s*[:：]?",
                 section,
             )
             if match:
@@ -237,7 +237,7 @@ def normalize_report_structure(
         for line_index, line in enumerate(lines):
             for field, pattern in REPORT_SOURCE_FIELD_PATTERNS.items():
                 match = re.match(
-                    rf"^\s*(?:#{{1,6}}\s*)?(?:[-*+]\s*)?(?:\*\*)?(?:{pattern})(?:\*\*)?\s*[:：]\s*(.*)$",
+                    rf"^\s*(?:#{{1,6}}\s*)?(?:[-*+]\s*)?(?:\*\*)?(?:{pattern})(?:\*\*\s*[:：]|\s*[:：]\s*(?:\*\*)|\s*[:：])\s*[:：]?\s*(.*)$",
                     line,
                     re.IGNORECASE,
                 )
@@ -281,6 +281,7 @@ def normalize_report_structure(
                 supplement.get(field)
                 if field in {
                     "risk_level", "enterprise_risk_level", "enterprise_basis",
+                    "suggested_revision", "issue",
                 } and supplement.get(field)
                 else values.get(field)
             )
@@ -292,7 +293,12 @@ def normalize_report_structure(
                 value = supplement.get(field) or missing_field_defaults.get(
                     field, "初稿未提供"
                 )
-            fields.append(f"- **{label}**: {value}")
+            field_label = (
+                f"**{label}：**"
+                if field == "enterprise_risk_level"
+                else f"**{label}**:"
+            )
+            fields.append(f"- {field_label} {value}")
         output_sections.append("\n".join(fields))
 
     return RISK_LEVEL_REPORT_LEGEND + "\n\n" + "\n\n".join(output_sections)
@@ -332,7 +338,7 @@ def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
         values = {}
         for field, label_pattern in field_patterns.items():
             match = re.search(
-                rf"(?im)^\s*(?:#{{1,6}}\s*)?[-*+]?\s*(?:\*\*)?(?:{label_pattern})(?:\*\*)?\s*[:：]\s*(.+?)\s*$",
+                rf"(?im)^\s*(?:#{{1,6}}\s*)?[-*+]?\s*(?:\*\*)?(?:{label_pattern})(?:\*\*\s*[:：]|\s*[:：]\s*(?:\*\*)|\s*[:：])\s*[:：]?\s*(.+?)\s*$",
                 section,
             )
             if match:

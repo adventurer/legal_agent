@@ -38,19 +38,24 @@ for directory in [REFERENCE_DOCS_DIR, DATA_DIR, MODELS_DIR]:
 # ==================== 2. 模型与推理服务 (vLLM) 配置 ====================
 # 模型注册表是模型名称、启动别名、权重目录和上下文配置的唯一来源。
 MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
-    "qwen2.5-3b": {
+    "qwen2.5-1.5b-awq": {
+        "served_name": "qwen2.5-1.5b", "model_dir_name": "Qwen2.5-1.5B-Instruct-AWQ",
+        "modelscope_id": "Qwen/Qwen2.5-1.5B-Instruct-AWQ", "max_model_len": 8192,
+        "gpu_utilization": 0.5, "quantization": "awq",
+    },
+    "qwen2.5-3b-awq": {
         "served_name": "qwen2.5-3b", "model_dir_name": "Qwen2.5-3B-Instruct-AWQ",
-        "modelscope_id": "Qwen/Qwen2.5-3B-Instruct-AWQ", "max_model_len": 4096,
-        "gpu_utilization": 0.80, "quantization": "awq",
+        "modelscope_id": "Qwen/Qwen2.5-3B-Instruct-AWQ", "max_model_len": 12000,
+        "gpu_utilization": 0.5, "quantization": "awq",
     },
     "qwen2.5-7b-awq": {
         "served_name": "qwen2.5-7b", "model_dir_name": "Qwen2.5-7B-Instruct-AWQ",
-        "modelscope_id": "Qwen/Qwen2.5-7B-Instruct-AWQ", "max_model_len": 8192,
-        "gpu_utilization": 0.85, "quantization": "awq",
+        "modelscope_id": "Qwen/Qwen2.5-7B-Instruct-AWQ", "max_model_len": 12000,
+        "gpu_utilization": 0.75, "quantization": "awq",
     },
     "qwen2.5-14b-awq": {
         "served_name": "qwen2.5-14b", "model_dir_name": "Qwen2.5-14B-Instruct-AWQ",
-        "modelscope_id": "Qwen/Qwen2.5-14B-Instruct-AWQ", "max_model_len": 4096,
+        "modelscope_id": "Qwen/Qwen2.5-14B-Instruct-AWQ", "max_model_len": 8192,
         "gpu_utilization": 0.88, "quantization": "awq",
     },
     "deepseek-r1-7b-awq": {
@@ -114,7 +119,13 @@ AGENT_CONFIG: Dict[str, Any] = {
     "temperature": 0.0,       # 设为 0 启用贪婪解码，保持法律审查结论高度确定
     "top_p": 1.0,
     "seed": 42,               # 显式固定随机种子
-    "max_tokens": 2048,       # 单步生成最大 Token 数
+    "max_tokens": 8192,       # 单步生成最大 Token 数
+    "report_format_repair_enabled": os.getenv(
+        "REPORT_FORMAT_REPAIR_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"},
+    "llm_risk_level_review_enabled": os.getenv(
+        "LLM_RISK_LEVEL_REVIEW_ENABLED", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"},
     "stop": ["Observation:"], # ReAct 工具调用截断符
     "max_turns": 6,           # 默认最大推理轮次
     "max_context_tokens": VLLM_CONFIG["max_model_len"],

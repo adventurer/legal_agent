@@ -25,6 +25,10 @@ from .tool_executor import ToolExecutor
 FINAL_REPORT_RETRY_LIMIT = 2
 
 
+def _max_output_tokens(max_context_tokens: int, requested_output_tokens: int) -> int:
+    return min(requested_output_tokens, max(1, max_context_tokens // 4))
+
+
 class ReactLoop:
     """Run ReAct turns and publish model/tool interaction events."""
 
@@ -41,6 +45,89 @@ class ReactLoop:
             if item.get("source_type") == "enterprise_rule"
             and (risk_level := str(item.get("enterprise_risk_level", "")).strip())
         }
+
+    @staticmethod
+    def _without_enterprise_risk_levels(observation: str) -> str:
+        try:
+            payload = json.loads(observation)
+        except (json.JSONDecodeError, TypeError):
+            return observation
+        if not isinstance(payload, dict) or not isinstance(payload.get("evidence"), list):
+            return observation
+        for item in payload["evidence"]:
+            if not isinstance(item, dict) or item.get("source_type") != "enterprise_rule":
+                continue
+            item.pop("enterprise_risk_level", None)
+            for key in ("text", "snippet"):
+                value = item.get(key)
+                if not isinstance(value, str):
+                    continue
+                item[key] = "\n".join(
+                    line for line in value.splitlines()
+                    if not line.lstrip().startswith((
+                        "风险级别:", "风险级别：", "风险等级:", "风险等级：",
+                    ))
+                )
+        return json.dumps(payload, ensure_ascii=False, default=str)
+
+    @staticmethod
+    def _enterprise_evidence_guidance(
+        evidence: Dict[str, Dict[str, Any]],
+    ) -> str:
+        include_risk_levels = AGENT_CONFIG.get(
+            "llm_risk_level_review_enabled", False
+        )
+        candidates = []
+        for evidence_id, item in evidence.items():
+            source_type = item.get("source_type")
+            if source_type not in {"enterprise_rule", "enterprise_document"}:
+                continue
+            text = str(item.get("text") or "")
+            if not include_risk_levels:
+                text = "\n".join(
+                    line for line in text.splitlines()
+                    if not line.lstrip().startswith((
+                        "风险级别:", "风险级别：", "风险等级:", "风险等级：",
+                    ))
+                )
+            reference_type = "RULE" if source_type == "enterprise_rule" else "KB"
+            candidates.append({
+                "source_type": source_type,
+                "title": item.get("title") or item.get("doc_name"),
+                "reference": f"[[{reference_type}:{evidence_id}]]",
+                "text": text,
+                **({
+                    "enterprise_risk_level": item.get("enterprise_risk_level"),
+                } if include_risk_levels and item.get("enterprise_risk_level") else {}),
+            })
+        candidates.sort(
+            key=lambda item: item["source_type"] != "enterprise_rule"
+        )
+        records = []
+        remaining_text_chars = 400
+        for item in candidates[:8]:
+            text_limit = min(
+                remaining_text_chars,
+                400 if item["source_type"] == "enterprise_rule" else 120,
+            )
+            record = {
+                "type": "enterprise_rule" if item["source_type"] == "enterprise_rule" else "enterprise_document",
+                "reference": item["reference"],
+                "title": item["title"],
+                "text": item["text"][:text_limit],
+            }
+            if item.get("enterprise_risk_level"):
+                record["risk_level"] = item["enterprise_risk_level"]
+            records.append(record)
+            remaining_text_chars -= min(len(item["text"]), text_limit)
+        if not records:
+            return ""
+        return (
+            "【必须遵守】以下企业证据由工具实际返回。合同涉及规则事项即适用，即使条款违反规则；"
+            "企业依据须引用精确 reference，并依规则标准提出修改建议；法律依据与企业依据分开。"
+            "不得称未检索到规则或编造编号。\n"
+            + json.dumps(records, ensure_ascii=False)
+        )
 
     async def stream(
         self,
@@ -67,10 +154,15 @@ class ReactLoop:
             if tool["function"]["name"] != FINAL_REPORT_TOOL_NAME
         ]
         executor = ToolExecutor(self.agent.tool_mapping, unavailable)
+        max_context_tokens = AGENT_CONFIG.get("max_context_tokens", 8192)
+        max_output_tokens = _max_output_tokens(
+            max_context_tokens,
+            AGENT_CONFIG.get("max_tokens", 1024),
+        )
         context = ContextWindowManager(
             model_name=self.agent.model_name,
-            max_context_tokens=AGENT_CONFIG.get("max_context_tokens", 8192),
-            output_tokens=AGENT_CONFIG.get("max_tokens", 1024),
+            max_context_tokens=max_context_tokens,
+            output_tokens=max_output_tokens,
         )
         messages = build_review_messages(contract_text, review_side, findings)
         duplicate_query_count = 0
@@ -118,7 +210,24 @@ class ReactLoop:
             else:
                 request_tools = tools
             try:
-                request_messages = context.fit_messages(messages, request_tools)
+                request_source_messages = messages
+                enterprise_evidence_pinned = False
+                if not missing_tools:
+                    enterprise_guidance = self._enterprise_evidence_guidance(
+                        recorder.evidence_records()
+                    )
+                    if enterprise_guidance:
+                        enterprise_evidence_pinned = True
+                        request_source_messages = list(messages)
+                        request_source_messages.append({
+                            "role": "user",
+                            "content": enterprise_guidance,
+                        })
+                request_messages = context.fit_messages(
+                    request_source_messages,
+                    request_tools,
+                    enterprise_evidence_pinned=enterprise_evidence_pinned,
+                )
             except ContextWindowError as exc:
                 yield encode_event("error", {
                     "task_id": task_label,
@@ -142,7 +251,7 @@ class ReactLoop:
                 "temperature": AGENT_CONFIG.get("temperature", 0.0),
                 "top_p": AGENT_CONFIG.get("top_p", 1.0),
                 "seed": AGENT_CONFIG.get("seed", 42),
-                "max_tokens": AGENT_CONFIG.get("max_tokens", 1024),
+                "max_tokens": max_output_tokens,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
@@ -389,8 +498,16 @@ class ReactLoop:
                         "call_id": call.call_id,
                         "query": query,
                     })
+                    model_observation = result.observation
+                    if (
+                        result.success
+                        and not AGENT_CONFIG.get("llm_risk_level_review_enabled", False)
+                    ):
+                        model_observation = self._without_enterprise_risk_levels(
+                            model_observation
+                        )
                     tool_content = (
-                        context.compact_observation(result.observation)
+                        context.compact_observation(model_observation)
                         if result.success else result.observation
                     )
                     recorder.record_result(
@@ -409,7 +526,11 @@ class ReactLoop:
                         for evidence_id, risk_level in enterprise_risk_evidence.items()
                         if risk_level.casefold() in high_risk_labels
                     ]
-                    if result.success and enterprise_risk_evidence:
+                    if (
+                        result.success
+                        and enterprise_risk_evidence
+                        and AGENT_CONFIG.get("llm_risk_level_review_enabled", False)
+                    ):
                         risk_evidence_summary = ", ".join(
                             f"{evidence_id}（{risk_level}）"
                             for evidence_id, risk_level in enterprise_risk_evidence.items()
@@ -417,9 +538,9 @@ class ReactLoop:
                         tool_content += (
                             "\n\n程序审查路由提示：本次检索命中企业内部风险规则 "
                             f"{risk_evidence_summary}。请将关联条款纳入对应风险等级的审查处置路径，"
-                            "核对规则适用性、合同事实和实际受影响方，并依据完整证据独立评定统一审查风险等级；"
-                            "不得仅因企业内部等级而机械升级或降级。企业内部风险等级须在报告中原样单独记录，"
-                            "不得将其伪装成法律结论。"
+                            "核对规则适用性、合同事实和实际受影响方。规则适用时，其内部等级是统一风险等级的最低处置线；"
+                            "合同证据支持更高等级时保留更高等级。企业内部风险等级须在报告中原样单独记录，"
+                            "并作为内部控制要求说明，不得将其伪装成法律结论。"
                         )
                     yield encode_event("tool_result", {
                         "task_id": task_label,
