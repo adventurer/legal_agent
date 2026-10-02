@@ -40,12 +40,12 @@ for directory in [REFERENCE_DOCS_DIR, DATA_DIR, MODELS_DIR]:
 MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
     "qwen2.5-1.5b-awq": {
         "served_name": "qwen2.5-1.5b", "model_dir_name": "Qwen2.5-1.5B-Instruct-AWQ",
-        "modelscope_id": "Qwen/Qwen2.5-1.5B-Instruct-AWQ", "max_model_len": 8192,
+        "modelscope_id": "Qwen/Qwen2.5-1.5B-Instruct-AWQ", "max_model_len": 16000,
         "gpu_utilization": 0.5, "quantization": "awq",
     },
     "qwen2.5-3b-awq": {
         "served_name": "qwen2.5-3b", "model_dir_name": "Qwen2.5-3B-Instruct-AWQ",
-        "modelscope_id": "Qwen/Qwen2.5-3B-Instruct-AWQ", "max_model_len": 12000,
+        "modelscope_id": "Qwen/Qwen2.5-3B-Instruct-AWQ", "max_model_len": 16000,
         "gpu_utilization": 0.5, "quantization": "awq",
     },
     "qwen2.5-7b-awq": {

@@ -8,6 +8,7 @@ from typing import Any, AsyncGenerator, Dict
 from starlette.concurrency import iterate_in_threadpool
 
 from configs.config import AGENT_CONFIG
+from services.report_parser import clean_report_content, is_final_report
 
 from .context_manager import ContextWindowError, ContextWindowManager
 from .contracts import ToolExecutionResult
@@ -581,6 +582,20 @@ class ReactLoop:
                     "task_id": task_label,
                     "error": "模型未返回文本或有效工具调用。",
                 })
+                return
+            final_report_text = clean_report_content(content)
+            if final_report_text and is_final_report(content):
+                finalizer = ReportFinalizer(self.agent)
+                async for event in finalizer.finalize(
+                    report=final_report_text,
+                    contract_text=contract_text,
+                    task_id=task_label,
+                    turn=turn,
+                    acknowledged_guardrails=guardrail_codes,
+                    finish_reason=decoder.finish_reason,
+                    tool_call_records=recorder,
+                ):
+                    yield event
                 return
             force_final_report = True
             messages.extend([

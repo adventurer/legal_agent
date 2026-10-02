@@ -31,6 +31,7 @@ from core.prompts import (
     RISK_LEVEL_REPORT_LEGEND,
 )
 from services.pdf_kb_search import search_pages
+from services.report_parser import parse_structured_report
 
 
 def _chunk(content=None, tool_calls=None, finish_reason=None, usage=None):
@@ -621,13 +622,13 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(final["raw_report"], report)
         self.assertEqual(requests, [])
 
-    def test_finalizer_passes_through_report_without_rule_assessments(self):
+    def test_finalizer_passes_through_report_without_rule_reconciliation(self):
         report = f"""{RISK_LEVEL_REPORT_LEGEND}
 
-### 第二条 付款条件
-- **风险类型**: 商业
-- **风险等级**: 中风险
-- **企业内部风险等级**: 未检索到企业内部风险等级
+    ### 第二条 付款条件
+     - **风险类型**: 商业
+     - **风险等级**: 中风险
+     - **企业内部风险等级**: 未检索到企业内部风险等级
 - **法律效力**: 未检索到直接依据
 - **商业后果**: 付款期限不明确可能导致结算延迟。
 - **救济成本**: 中
@@ -638,14 +639,7 @@ class ReActLoopTests(unittest.TestCase):
 - **风险剖析**: 付款期限需要明确。
 - **修改建议**: 明确付款期限。
 """
-        missing_assessment = json.dumps({
-            "rule_assessments": [],
-            "supplements": [],
-        }, ensure_ascii=False)
-        agent, requests = _agent(iter([
-            [_chunk(content=missing_assessment, finish_reason="stop")],
-            [_chunk(content=missing_assessment, finish_reason="stop")],
-        ]))
+        agent, requests = _agent(iter([]))
         recorder = ToolCallRecorder("missing-rule-assessment")
         recorder.record_call(1, "call_rule", "get_past_review_rules", "{\"query\":\"付款期限\"}")
         recorder.record_result(
@@ -680,12 +674,19 @@ class ReActLoopTests(unittest.TestCase):
         )
         self.assertFalse(any(event["event"] == "rule_assessment" for event in events))
         self.assertEqual(final["raw_report"], report)
+        reconciliation = next(
+            json.loads(event["data"])
+            for event in events
+            if event["event"] == "pipeline_stage"
+            and json.loads(event["data"])["stage"] == "report_reconciliation"
+        )
+        self.assertEqual(reconciliation["status"], "skipped")
         self.assertEqual(final["status"], "success")
         self.assertTrue(final["is_complete"])
         self.assertEqual(recorder.status, "success")
         self.assertEqual(requests, [])
 
-    def test_finalizer_does_not_reconcile_enterprise_rule_assessments(self):
+    def test_finalizer_directly_outputs_report_with_enterprise_rule(self):
         report = f"""{RISK_LEVEL_REPORT_LEGEND}
 
 ### 第二条 付款条件
@@ -697,35 +698,12 @@ class ReActLoopTests(unittest.TestCase):
 - **救济成本**: 中
 - **受影响方**: 乙方
 - **结论置信度**: 中
-- **法律/合规依据**: 未检索到直接依据
+- **法律/合规依据**: [[RULE:RULE2]]
 - **企业知识库依据**: 未检索到相关企业规则或知识库依据
 - **风险剖析**: 尾款付款时间由甲方资金情况决定。
 - **修改建议**: 明确尾款支付期限。
 """
         contract_text = "甲方按季度资金周转充裕情况安排支付尾款，且付款期限不受商业惯例限制。"
-        first_assessment = json.dumps({
-            "rule_assessments": [{
-                "evidence_id": "RULE2",
-                "applicability": "applicable",
-                "applicable_clauses": [{
-                    "clause_topic": "付款条件与结算周期",
-                    "contract_basis": "甲方按季度资金周转充裕情况安排支付尾款",
-                    "reason": "付款安排取决于甲方资金情况，属于规则禁止的主观条件。",
-                    "recommendation_for_report": "约定验收后固定期限内支付尾款。",
-                }],
-            }],
-            "supplements": [],
-        }, ensure_ascii=False)
-        contradictory_retry = json.dumps({
-            "rule_assessments": [{
-                "evidence_id": "RULE2",
-                "applicability": "not_applicable",
-                "applicable_clauses": [],
-                "contract_basis": "验收合格后的15个工作日内支付尾款",
-                "not_applicable_reason": "合同已明确验收后的付款期限。",
-            }],
-            "supplements": [],
-        }, ensure_ascii=False)
         agent, requests = _agent(iter([]))
         recorder = ToolCallRecorder("contradictory-rule-assessment")
         recorder.record_call(1, "call_rule", "get_past_review_rules", "{}");
@@ -759,8 +737,8 @@ class ReActLoopTests(unittest.TestCase):
             for event in events
             if event["event"] == "final_report"
         )
-        self.assertFalse(any(event["event"] == "rule_assessment" for event in events))
         self.assertEqual(final["raw_report"], report)
+        self.assertIn("[[RULE:RULE2]]", final["raw_report"])
         self.assertEqual(final["status"], "success")
         self.assertTrue(final["is_complete"])
         self.assertEqual(requests, [])
@@ -1269,17 +1247,12 @@ class ReActLoopTests(unittest.TestCase):
         )
         self.assertEqual(events[-2]["event"], "final_report")
 
-    def test_plain_text_final_forces_structured_submission(self):
+    def test_prefaced_plain_text_final_finishes_without_repeat_submission(self):
         responses = iter([
-            [_chunk(content="### 审查结论\n建议明确仲裁条款。", finish_reason="stop")],
-            [_chunk(tool_calls=[_tool_call_delta(
-                "final",
-                "submit_final_report",
-                json.dumps({
-                    "report": "### 审查结论\n建议明确仲裁条款。",
-                    "acknowledged_guardrails": [],
-                }, ensure_ascii=False),
-            )], finish_reason="tool_calls")],
+            [_chunk(
+                content="最终报告如下：\n### 审查结论\n建议明确仲裁条款。",
+                finish_reason="stop",
+            )],
         ])
         agent, requests = _agent(responses)
 
@@ -1289,11 +1262,7 @@ class ReActLoopTests(unittest.TestCase):
             )]
 
         events = asyncio.run(collect())
-        self.assertEqual(requests[1]["tool_choice"], "required")
-        self.assertEqual(
-            [tool["function"]["name"] for tool in requests[1]["tools"]],
-            ["submit_final_report"],
-        )
+        self.assertEqual(len(requests), 1)
         self.assertEqual([item["event"] for item in events][-2:], ["final_report", "done"])
         final = json.loads(events[-2]["data"])
         self.assertTrue(final["is_complete"])

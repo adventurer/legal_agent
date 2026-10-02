@@ -242,6 +242,20 @@ class ReportFinalizer:
         )
 
     @staticmethod
+    def _remove_rule_citations_from_legal_basis(report: str) -> str:
+        pattern = re.compile(
+            r"(?im)^(?P<prefix>\s*[-*+]\s*(?:\*\*)?法律(?:/合规)?依据"
+            r"(?:\*\*)?\s*[:：]\s*)(?P<value>.*)$"
+        )
+
+        def clean(match: re.Match[str]) -> str:
+            value = re.sub(r"\[\[RULE:[^\]]+\]\]", "", match.group("value"))
+            value = re.sub(r"^[\s；;，,]+|[\s；;，,]+$", "", value)
+            return match.group("prefix") + (value or "未检索到直接依据")
+
+        return pattern.sub(clean, report)
+
+    @staticmethod
     def _validated_supplements(
         report: str,
         proposed: Dict[str, Dict[str, Any]],
@@ -381,14 +395,14 @@ class ReportFinalizer:
             "task_id": task_id,
             "stage": "report_reconciliation",
             "status": "skipped",
-            "message": "已关闭企业规则核验和报告补写，直接采用大模型输出",
+            "message": "已关闭企业规则核对，直接输出模型提交报告",
             "count": call_count,
         })
         yield encode_event("pipeline_stage", {
             "task_id": task_id,
             "stage": "review_complete",
             "status": "completed",
-            "message": "已接收大模型报告输出",
+            "message": "已接收模型提交报告",
         })
         tool_call_records.finish("success")
         yield encode_event("pipeline_stage", {

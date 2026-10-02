@@ -59,7 +59,9 @@ def is_final_report(text: str) -> bool:
     """判断模型输出是否已经进入最终审查报告阶段。"""
     if not text:
         return False
-    if any(marker in text for marker in ("Final:", "【最终结论】", "最终审查意见", "综合审查报告")):
+    if any(marker in text for marker in (
+        "Final:", "【最终结论】", "最终审查意见", "综合审查报告", "最终报告如下",
+    )):
         return True
     return sum(signature in text for signature in REPORT_SIGNATURES) >= 2
 
@@ -67,7 +69,10 @@ def is_final_report(text: str) -> bool:
 def clean_report_content(raw_text: str) -> str:
     """移除最终报告标记和正文中的代码围栏，保留围栏内文本内容。"""
     cleaned = (raw_text or "").strip()
-    for prefix in ("Final:", "【最终结论】:", "【最终结论】", "最终审查意见:"):
+    for prefix in (
+        "最终报告如下：", "最终报告如下:", "Final:",
+        "【最终结论】:", "【最终结论】", "最终审查意见:",
+    ):
         if prefix in cleaned:
             cleaned = cleaned.split(prefix, 1)[1].strip()
             break
