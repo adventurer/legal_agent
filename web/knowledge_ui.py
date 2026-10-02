@@ -42,11 +42,12 @@ def _request(
         management_route_missing = False
         if exc.response is not None:
             management_route_missing = (
-                exc.response.status_code == 404
+                exc.response.status_code in {404, 405}
                 and path.startswith("/api/v1/knowledge/")
             )
             if management_route_missing:
                 st.session_state["knowledge_gateway_restart_required"] = True
+                st.warning("当前网关尚未加载最新的知识库管理接口，请返回合同审查工作台重启网关后重试。")
             try:
                 detail = exc.response.json().get("detail", detail)
             except (ValueError, AttributeError):
@@ -154,10 +155,58 @@ def _render_document_library(
                 with st.expander(f"资料预览：{selected_preview}", expanded=True):
                     if selected_preview.lower().endswith(".pdf"):
                         st.pdf(preview_response.content)
+                        if category in {"enterprise", "general"}:
+                            with st.form(f"knowledge-replace-{category}-{selected_preview}"):
+                                replacement_file = st.file_uploader(
+                                    "替换 PDF 文件",
+                                    type=["pdf"],
+                                    key=f"knowledge-replacement-{category}-{selected_preview}",
+                                )
+                                replace_submitted = st.form_submit_button("替换并重建索引")
+                            if replace_submitted:
+                                if replacement_file is None:
+                                    st.warning("请先选择替换用的 PDF 文件。")
+                                else:
+                                    result = _request(
+                                        "PUT",
+                                        api_base_url,
+                                        "/api/v1/knowledge/document-file",
+                                        files={
+                                            "file": (
+                                                replacement_file.name,
+                                                replacement_file.getvalue(),
+                                                replacement_file.type or "application/pdf",
+                                            )
+                                        },
+                                        data={"filename": selected_preview},
+                                    )
+                                    if result is not None:
+                                        st.toast("PDF 已替换，检索索引已刷新。")
+                                        st.rerun()
                     else:
                         language = "markdown" if selected_preview.lower().endswith(".md") else None
                         content = preview_response.content.decode("utf-8-sig", errors="replace")
-                        st.code(content, language=language, wrap_lines=True)
+                        if category in {"enterprise", "general"}:
+                            with st.form(f"knowledge-edit-{category}-{selected_preview}"):
+                                edited_content = st.text_area(
+                                    "资料内容",
+                                    value=content,
+                                    height=420,
+                                    key=f"knowledge-content-{category}-{selected_preview}",
+                                )
+                                save_submitted = st.form_submit_button("保存并重建索引", type="primary")
+                            if save_submitted:
+                                result = _request(
+                                    "PUT",
+                                    api_base_url,
+                                    "/api/v1/knowledge/document-content",
+                                    json={"filename": selected_preview, "content": edited_content},
+                                )
+                                if result is not None:
+                                    st.toast("资料已保存，检索索引已刷新。")
+                                    st.rerun()
+                        else:
+                            st.code(content, language=language, wrap_lines=True)
 
         selected_filename = st.selectbox(
             "选择要移除的资料",

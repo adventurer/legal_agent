@@ -44,6 +44,35 @@ def determine_tag(filename: str) -> str:
     return "通用"
 
 
+def pdf_text_cache_path(pdf_path: Path, tag: str = "") -> Path:
+    if (tag or determine_tag(pdf_path.name)) == "法":
+        return pdf_path.with_suffix(".pdf.law.txt")
+    return pdf_path.with_suffix(".pdf.txt")
+
+
+def law_text_related_files(law_text_path: Path) -> List[Path]:
+    suffix = ".law.txt"
+    if not law_text_path.name.lower().endswith(suffix):
+        return []
+
+    pdf_path = law_text_path.with_name(law_text_path.name[:-len(suffix)] + ".pdf")
+    related = {
+        law_text_path.with_suffix(".articles.json"),
+        law_text_path.with_suffix(".articles.json.tmp"),
+        pdf_path,
+        pdf_path.with_suffix(".articles.json"),
+        pdf_path.with_suffix(".articles.json.tmp"),
+    }
+    for cache_path in {pdf_text_cache_path(pdf_path), pdf_path.with_suffix(".pdf.txt")}:
+        meta_path = cache_path.with_suffix(cache_path.suffix + ".meta.json")
+        related.update({
+            cache_path,
+            meta_path,
+            meta_path.with_suffix(meta_path.suffix + ".tmp"),
+        })
+    return sorted(related)
+
+
 def _sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -159,14 +188,16 @@ def load_article_cache(cache_path: Path, source_hash: str) -> List[Dict[str, Any
     return []
 
 
-def save_article_cache(cache_path: Path, articles: List[Dict[str, Any]], source_hash: str) -> None:
+def save_article_cache(cache_path: Path, articles: List[Dict[str, Any]], source_hash: str) -> bool:
     temp_path = cache_path.with_suffix(cache_path.suffix + ".tmp")
     try:
         temp_path.write_text(json.dumps({"version": 1, "source_sha256": source_hash, "articles": articles}, ensure_ascii=False), encoding="utf-8")
         os.replace(temp_path, cache_path)
+        return True
     except OSError as exc:
         print(f"[警告] 写入法条缓存失败: {cache_path.name}, 详情: {exc}")
         temp_path.unlink(missing_ok=True)
+        return False
 
 
 def load_pdf(pdf_path: Path, doc_name: str, tag: str) -> List[Dict[str, Any]]:
@@ -215,16 +246,55 @@ def load_pdf(pdf_path: Path, doc_name: str, tag: str) -> List[Dict[str, Any]]:
     return pages
 
 
+def convert_law_source_to_txt(source_path: Path, destination: Path, doc_name: str) -> bool:
+    if source_path.suffix.lower() == ".pdf":
+        pages = load_pdf(source_path, doc_name, "法")
+    else:
+        try:
+            text = source_path.read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as exc:
+            print(f"[警告] 法规文本读取失败: {source_path.name}, 详情: {exc}")
+            return False
+        pages = [{"doc_name": doc_name, "page_num": 1, "text": text, "tag": "法"}]
+    pages = [
+        {**page, "doc_name": destination.name, "tag": "法"}
+        for page in pages
+        if str(page.get("text", "")).strip()
+    ]
+    if not pages or not save_cache(destination, pages):
+        return False
+
+    source_hash = _sha256(destination)
+    canonical_pages = load_cache(destination, destination.name, "法")
+    articles = split_pages_into_articles(canonical_pages, source_hash)
+    article_cache_path = destination.with_suffix(".articles.json")
+    if articles and save_article_cache(article_cache_path, articles, source_hash):
+        return True
+
+    destination.unlink(missing_ok=True)
+    article_cache_path.unlink(missing_ok=True)
+    return False
+
+
 def load_documents(docs_dir: Path) -> List[Dict[str, Any]]:
     if not docs_dir.exists():
         print(f"[警告] 知识库目录不存在: {docs_dir}")
         return []
-    pdf_files = list(docs_dir.glob("*.pdf"))
+    pdf_files = [
+        path for path in docs_dir.glob("*.pdf")
+        if not path.name.startswith(".kb-upload-")
+        if determine_tag(path.name) != "法"
+    ]
     text_files = sorted(
         path for path in docs_dir.iterdir()
         if path.is_file()
+        and not path.name.startswith(".kb-upload-")
         and path.suffix.lower() in {".txt", ".md"}
-        and not path.name.lower().endswith(".pdf.txt")
+        and not path.name.lower().endswith((".pdf.txt", ".pdf.law.txt"))
+        and (
+            determine_tag(path.name) != "法"
+            or path.name.lower().endswith(".law.txt")
+        )
     )
     print(f"[*] 正在从 {docs_dir} 加载参考文档，发现 {len(pdf_files)} 个 PDF 和 {len(text_files)} 个文本文件...")
     pages: List[Dict[str, Any]] = []
@@ -232,15 +302,24 @@ def load_documents(docs_dir: Path) -> List[Dict[str, Any]]:
     for text_path in text_files:
         doc_name, tag = text_path.name, determine_tag(text_path.name)
         source_hash = _sha256(text_path)
+        is_markdown = text_path.suffix.lower() == ".md"
+        if is_markdown:
+            source_hash = hashlib.sha256(
+                f"{source_hash}:markdown-preserved-lines-v1".encode("utf-8")
+            ).hexdigest()
         article_cache_path = text_path.with_suffix(".articles.json")
         cached_articles = load_article_cache(article_cache_path, source_hash)
         if cached_articles:
             articles.extend(cached_articles)
             print(f"  [⚡法条缓存命中] {doc_name} ({len(cached_articles)} 条/片段)")
             continue
-        text = text_path.read_text(encoding="utf-8-sig")
-        page = {"doc_name": doc_name, "page_num": 1, "text": " ".join(text.split()), "tag": tag}
-        loaded_articles = split_pages_into_articles([page], source_hash)
+        if tag == "法" and text_path.read_text(encoding="utf-8-sig").startswith(PAGE_SEP_PREFIX):
+            source_pages = load_cache(text_path, doc_name, tag)
+        else:
+            text = text_path.read_text(encoding="utf-8-sig")
+            source_text = text if is_markdown else " ".join(text.split())
+            source_pages = [{"doc_name": doc_name, "page_num": 1, "text": source_text, "tag": tag}]
+        loaded_articles = split_pages_into_articles(source_pages, source_hash)
         articles.extend(loaded_articles)
         save_article_cache(article_cache_path, loaded_articles, source_hash)
         print(f"  [+] {doc_name} 已载入 ({len(loaded_articles)} 条/片段)")
@@ -248,14 +327,13 @@ def load_documents(docs_dir: Path) -> List[Dict[str, Any]]:
         doc_name, tag = pdf_path.name, determine_tag(pdf_path.name)
         source_hash = _sha256(pdf_path)
         article_cache_path = pdf_path.with_suffix(".articles.json")
-        cached_articles = load_article_cache(article_cache_path, source_hash)
-        if cached_articles:
-            articles.extend(cached_articles)
-            print(f"  [⚡法条缓存命中] {doc_name} ({len(cached_articles)} 条/片段)")
-            continue
-        cache_path = pdf_path.with_suffix(".pdf.txt")
+        cached_articles = (
+            load_article_cache(article_cache_path, source_hash)
+            if tag != "法" else []
+        )
+        cache_path = pdf_text_cache_path(pdf_path, tag)
         meta_path = cache_path.with_suffix(cache_path.suffix + ".meta.json")
-        loaded = False
+        cached_pages = []
         if cache_path.exists() and meta_path.exists():
             try:
                 metadata = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -263,25 +341,14 @@ def load_documents(docs_dir: Path) -> List[Dict[str, Any]]:
                     metadata.get("source_sha256") == source_hash
                     and metadata.get("cache_sha256") == _sha256(cache_path)
                 ):
-                    cached = load_cache(cache_path, doc_name, tag)
+                    cached_pages = load_cache(cache_path, doc_name, tag)
                 else:
-                    cached = []
-                if cached:
-                    loaded_articles = split_pages_into_articles(cached, source_hash)
-                    articles.extend(loaded_articles)
-                    save_article_cache(article_cache_path, loaded_articles, source_hash)
-                    loaded = True
-                    print(f"  [⚡缓存命中] {doc_name} -> {len(loaded_articles)} 条/片段")
+                    print(f"  [!] 缓存校验失败，将重新解析 PDF: {cache_path.name}")
             except Exception as exc:
                 print(f"  [!] 读取缓存异常，重新解析 PDF: {cache_path.name}, 详情: {exc}")
-        if loaded:
-            continue
-        loaded_pages = load_pdf(pdf_path, doc_name, tag)
-        if loaded_pages:
-            loaded_articles = split_pages_into_articles(loaded_pages, source_hash)
-            articles.extend(loaded_articles)
-            save_article_cache(article_cache_path, loaded_articles, source_hash)
-            if save_cache(cache_path, loaded_pages):
+        if not cached_pages:
+            cached_pages = load_pdf(pdf_path, doc_name, tag)
+            if cached_pages and save_cache(cache_path, cached_pages):
                 try:
                     metadata = json.dumps({
                         "source_sha256": _sha256(pdf_path),
@@ -292,7 +359,15 @@ def load_documents(docs_dir: Path) -> List[Dict[str, Any]]:
                     os.replace(meta_tmp, meta_path)
                 except OSError as exc:
                     print(f"[警告] 知识库缓存元数据写入失败: {meta_path.name}, 详情: {exc}")
-            print(f"  [+] {doc_name} 解析完成 ({len(loaded_pages)} 页)，已生成缓存: {cache_path.name}")
+                print(f"  [+] {doc_name} 解析完成 ({len(cached_pages)} 页)，已生成缓存: {cache_path.name}")
+        if cached_articles:
+            articles.extend(cached_articles)
+            print(f"  [⚡法条缓存命中] {doc_name} ({len(cached_articles)} 条/片段)")
+        elif cached_pages:
+            loaded_articles = split_pages_into_articles(cached_pages, source_hash)
+            articles.extend(loaded_articles)
+            save_article_cache(article_cache_path, loaded_articles, source_hash)
+            print(f"  [⚡缓存载入] {doc_name} -> {len(loaded_articles)} 条/片段")
         else:
             print(f"  [!] {doc_name} 未提取到有效文本（可能是纯扫描图片）。")
     print(f"[+] 知识库索引构建完成，共载入 {len(articles)} 条/片段参考内容。")

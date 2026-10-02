@@ -77,6 +77,37 @@ class ReportParserTests(unittest.TestCase):
             normalized,
         )
 
+    def test_normalization_keeps_fields_before_embedded_contract_heading(self):
+        raw_report = f"""{RISK_LEVEL_REPORT_LEGEND}
+
+**风险类型**: 法律合规
+**风险等级**: 中风险
+**企业内部风险等级**: High
+**法律效力**: 有直接依据的判断
+**商业后果**: 尾款支付周期较长
+**救济成本**: 中
+**受影响方**: 乙方
+**结论置信度**: 中
+**法律/合规依据**: [[RULE:RULE2]]
+**企业知识库依据**: [[KB:EVC7FC2169C3B9]]
+**风险剖析**: 尾款支付周期可能影响乙方资金流动性。
+**修改建议**: 将尾款支付周期限定为30个工作日。
+
+# 第二条 验收标准与付款周期
+
+合同原文内容。
+"""
+
+        normalized = normalize_report_structure(raw_report)
+
+        self.assertIn("- **风险类型**: 法律合规", normalized)
+        self.assertIn("- **风险等级**: 中风险", normalized)
+        self.assertIn("- **企业内部风险等级：** High", normalized)
+        self.assertIn("- **受影响方**: 乙方", normalized)
+        self.assertIn("尾款支付周期可能影响乙方资金流动性。", normalized)
+        self.assertIn("将尾款支付周期限定为30个工作日。", normalized)
+        self.assertNotIn("初稿未提供", normalized)
+
     def test_normalization_applies_validated_supplement_over_no_match_defaults(self):
         raw_report = """### 第五条 服务保障
 - **风险等级**: 中风险

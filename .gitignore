@@ -4,5 +4,8 @@ data/*
 *.pyc
 reference_docs/*.pdf.txt.meta.json
 reference_docs/*.pdf.txt.*.tmp
+reference_docs/*.pdf.law.txt
+reference_docs/*.pdf.law.txt.meta.json
+reference_docs/*.pdf.law.txt.*.tmp
 reference_docs/*.articles.json
 reference_docs/*.articles.json.tmp

@@ -28,6 +28,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.append(str(ROOT_DIR))
 
 import streamlit as st
+from markdown_it import MarkdownIt
 import httpx
 from core.prompts import RISK_LEVEL_REPORT_LEGEND
 from services.report_parser import (
@@ -44,6 +45,7 @@ from web.contract_client import rewrite_contract
 from web.report_exporter import report_to_docx
 
 API_BASE_URL = "http://127.0.0.1:9000"
+_MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": False})
 GATEWAY_SCRIPT = ROOT_DIR / "gateway" / "api_server.py"
 GATEWAY_LOG = ROOT_DIR / "data" / "gateway.log"
 _gateway_process: Optional[subprocess.Popen] = None
@@ -308,30 +310,38 @@ def render_saved_review_flow() -> None:
     st.markdown(f"##### 审查进度 · {flow.get('status', '审查中')}")
     if flow.get("mode") == "stream":
         st.markdown(f"**审查对象：{flow.get('title', '合同正文')}**")
-        st.markdown(
-            render_model_output_box(
-                flow.get("events", []),
-                flow.get("thought", ""),
-                flow.get("model_report", ""),
-            ),
-            unsafe_allow_html=True,
+        model_report = (
+            "" if flow.get("status") == "审查完成"
+            else flow.get("model_report", "")
         )
-        if flow.get("report"):
-            st.markdown(report_text_for_display(flow["report"]))
+        rendered_output = render_model_output_box(
+            flow.get("events", []),
+            flow.get("thought", ""),
+            model_report,
+        )
+        if flow.get("status") in {"审查完成", "审查失败"}:
+            with st.expander("模型交互记录", expanded=False):
+                st.markdown(rendered_output, unsafe_allow_html=True)
+        else:
+            st.markdown(rendered_output, unsafe_allow_html=True)
         return
 
     for clause in flow.get("clauses", {}).values():
         st.markdown(f"**{clause.get('status', '审查中')}：{clause.get('title', '')}**")
-        st.markdown(
-            render_model_output_box(
-                clause.get("flow", []),
-                clause.get("thought", ""),
-                clause.get("model_report", clause.get("report", "")),
-            ),
-            unsafe_allow_html=True,
+        model_report = (
+            "" if clause.get("status") == "审查完成"
+            else clause.get("model_report", clause.get("report", ""))
         )
-        if clause.get("final_report"):
-            st.markdown(report_text_for_display(clause["final_report"]))
+        rendered_output = render_model_output_box(
+            clause.get("flow", []),
+            clause.get("thought", ""),
+            model_report,
+        )
+        if clause.get("status") in {"审查完成", "审查失败"}:
+            with st.expander("模型交互记录", expanded=False):
+                st.markdown(rendered_output, unsafe_allow_html=True)
+        else:
+            st.markdown(rendered_output, unsafe_allow_html=True)
 
 
 @st.dialog("条款内容")
@@ -380,9 +390,11 @@ def show_evidence_content(evidence: Dict[str, Any]) -> None:
 
 
 def format_report_evidence_refs(
-    report: str, evidence_records: Optional[Dict[str, Dict[str, Any]]] = None
+    report: str,
+    evidence_records: Optional[Dict[str, Dict[str, Any]]] = None,
+    inline_sources: bool = False,
 ) -> str:
-    """Replace internal evidence IDs with readable source titles and page numbers."""
+    """Replace internal evidence IDs with readable citations and optional inline sources."""
     records = evidence_records or {}
     document_titles = {
         "minfadian": "中华人民共和国民法典",
@@ -403,17 +415,34 @@ def format_report_evidence_refs(
         if evidence.get("title") and evidence.get("source_type") == "enterprise_rule":
             citation += f" · {evidence['title']}"
         if evidence.get("source_location"):
-            return f"{citation}（{evidence['source_location']}）"
-        if evidence.get("source_path"):
+            citation += f"（{evidence['source_location']}）"
+        elif evidence.get("source_path"):
             citation += f"（{evidence['source_path']}）"
-        page_start = evidence.get("page_start")
-        page_end = evidence.get("page_end", page_start)
-        if page_start is None:
+        else:
+            page_start = evidence.get("page_start")
+            page_end = evidence.get("page_end", page_start)
+            if page_start is not None:
+                page_label = f"第 {page_start} 页"
+                if page_end is not None and page_end != page_start:
+                    page_label += f"–{page_end} 页"
+                citation += f"（{page_label}）"
+        if not inline_sources:
             return citation
-        page_label = f"第 {page_start} 页"
-        if page_end is not None and page_end != page_start:
-            page_label += f"–{page_end} 页"
-        return f"{citation}（{page_label}）"
+        raw_source_text = str(evidence.get("text") or "未找到原文内容")
+        is_markdown = Path(raw_name).suffix.lower() == ".md"
+        source_text = (
+            _MARKDOWN_RENDERER.render(raw_source_text)
+            if is_markdown else html.escape(raw_source_text)
+        )
+        source_style = "white-space:normal;" if is_markdown else "white-space:pre-wrap;"
+        return (
+            '<details style="display:inline-block; vertical-align:baseline;">'
+            '<summary style="display:inline; cursor:pointer; color:#126e76; text-decoration:underline;">'
+            f"{html.escape(citation)}</summary>"
+            f'<div style="{source_style} padding:0.5rem 0.7rem; margin:0.35rem 0; '
+            'border-left:2px solid #126e76; background:#f3f8f8;">'
+            f"{source_text}</div></details>"
+        )
 
     reference_pattern = (
         r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]|"
@@ -775,7 +804,6 @@ def execute_stream_review(
         status_label = st.empty()
         status_label.markdown(f"**正在初始化 ReAct 推理链路 ({target_name})...**")
 
-    report_container = st.empty()
     st.caption(f"审查进度 [{target_name}]")
     thought_container = st.empty()
 
@@ -878,7 +906,7 @@ def execute_stream_review(
     )
     st.session_state.evidence_records.update(result["evidence_records"])
     accumulated_tokens = result["model_text"]
-    accumulated_report = result["model_report"]
+    accumulated_report = result["model_report"] if not result["success"] else ""
     saved_flow["thought"] = accumulated_tokens
     saved_flow["model_report"] = accumulated_report
     refresh_thought_box()
@@ -893,7 +921,6 @@ def execute_stream_review(
 
     formatted_report = result["report"]
     saved_flow["report"] = formatted_report
-    report_container.markdown(report_text_for_display(formatted_report))
     parsed_report = parse_structured_report(formatted_report)
     st.session_state.structured_report = (
         parsed_report.model_dump(mode="json") if parsed_report else None
@@ -1011,7 +1038,6 @@ def execute_concurrent_clause_review(
 
     status_placeholders = {}
     thought_placeholders = {}
-    report_placeholders = {}
     live_state = {}
     display_cols_count = min(4, max(2, min(total_count, max_workers)))
     st_cols = st.columns(display_cols_count, gap="small")
@@ -1025,7 +1051,6 @@ def execute_concurrent_clause_review(
             thought_placeholders[clause_index].markdown(
                 render_reasoning_text(""), unsafe_allow_html=True
             )
-            report_placeholders[clause_index] = st.empty()
             live_state[clause_index] = {
                 "title": c.get("title", ""),
                 "status": "排队中",
@@ -1081,9 +1106,13 @@ def execute_concurrent_clause_review(
             )
         for clause_index in changed_thoughts | changed_reports | changed_flows:
             state = live_state[clause_index]
+            model_report = (
+                "" if state["status"] == "审查完成"
+                else state["model_report"]
+            )
             thought_placeholders[clause_index].markdown(
                 render_model_output_box(
-                    state["flow"], state["thought"], state["report"]
+                    state["flow"], state["thought"], model_report
                 ),
                 unsafe_allow_html=True,
             )
@@ -1129,14 +1158,9 @@ def execute_concurrent_clause_review(
                     render_model_output_box(
                         live_state[c_idx]["flow"],
                         live_state[c_idx]["thought"],
-                        live_state[c_idx]["model_report"],
+                        "",
                     ),
                     unsafe_allow_html=True,
-                )
-                report_placeholders[c_idx].markdown(
-                    report_text_for_display(live_state[c_idx]["final_report"])
-                    if live_state[c_idx]["final_report"]
-                    else "审查完成，报告正在整理..."
                 )
                 progress_bar.progress(
                     completed_count / total_count,
@@ -1169,7 +1193,7 @@ def execute_concurrent_clause_review(
 
 # ==================== 8. 下部：审查轨迹与展示 ====================
 with nullcontext():
-    st.markdown("#### 🔍 审查推理轨迹与法务终审报告")
+    st.markdown("#### 🔍 模型交互记录与风险审查报告")
     render_saved_review_flow()
 
     if selected_clause_idx is not None:
@@ -1312,39 +1336,44 @@ with nullcontext():
                                 st.markdown(f"**{label_text}：** {item[field]}")
                         legal_basis = item.get("legal_basis", "")
                         evidence_ids = list(dict.fromkeys(re.findall(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", legal_basis)))
+                        legal_basis_for_display = legal_basis
+                        if not evidence_ids and evidence_records:
+                            article_refs = set(re.findall(r"第\s*[零〇一二三四五六七八九十百千万两0-9]+\s*条", legal_basis))
+                            for article_ref in article_refs:
+                                matching_refs = []
+                                for evidence_id, evidence in evidence_records.items():
+                                    if evidence.get("article_no") != article_ref:
+                                        continue
+                                    if re.fullmatch(r"EV[A-Za-z0-9]+", evidence_id):
+                                        matching_refs.append(f"[[EVIDENCE:{evidence_id}]]")
+                                    elif re.fullmatch(r"RULE\d+", evidence_id):
+                                        matching_refs.append(f"[[RULE:{evidence_id}]]")
+                                if matching_refs:
+                                    legal_basis_for_display = legal_basis_for_display.replace(
+                                        article_ref, "、".join(matching_refs), 1
+                                    )
                         visible_basis = format_report_evidence_refs(
-                            legal_basis, st.session_state.evidence_records
+                            legal_basis_for_display,
+                            st.session_state.evidence_records,
+                            inline_sources=True,
                         ).strip()
                         visible_basis = re.sub(r"^[\s、，,；;]+|[\s、，,；;]+$", "", visible_basis)
                         if visible_basis:
-                            st.markdown(f"**法律/合规依据：** {visible_basis}")
+                            st.markdown(f"**法律/合规依据：** {visible_basis}", unsafe_allow_html=True)
                         elif evidence_ids:
                             st.markdown("**法律/合规依据：** 关联以下检索原文（请核对原文是否支持本项分析）")
                         else:
                             st.markdown("**法律/合规依据：** 未检索到直接依据")
                         enterprise_basis = format_report_evidence_refs(
-                            item.get("enterprise_basis", ""), st.session_state.evidence_records
+                            item.get("enterprise_basis", ""),
+                            st.session_state.evidence_records,
+                            inline_sources=True,
                         ).strip()
                         if enterprise_basis:
-                            st.markdown(f"**企业知识库依据：** {enterprise_basis}")
+                            st.markdown(f"**企业知识库依据：** {enterprise_basis}", unsafe_allow_html=True)
                         for evidence_id in evidence_ids:
-                            evidence = st.session_state.evidence_records.get(evidence_id)
-                            if evidence:
-                                citation = f"《{evidence.get('doc_name', '参考文档')}》 {evidence.get('article_no') or ''} {evidence.get('title') or ''}".strip()
-                                if st.button(f"查看依据原文：{citation}", key=f"evidence_{level}_{index}_{evidence_id}"):
-                                    show_evidence_content(evidence)
-                            else:
+                            if evidence_id not in st.session_state.evidence_records:
                                 st.warning(f"报告引用的证据 {evidence_id} 未在本次检索记录中找到。")
-                        if not evidence_ids and evidence_records:
-                            article_refs = set(re.findall(r"第\s*[零〇一二三四五六七八九十百千万两0-9]+\s*条", legal_basis))
-                            related = [
-                                evidence for evidence in evidence_records.values()
-                                if evidence.get("article_no") in article_refs
-                            ]
-                            for evidence_index, evidence in enumerate(related):
-                                citation = f"{evidence.get('doc_name', '参考文档')} {evidence.get('article_no', '')} {evidence.get('title', '')}".strip()
-                                if st.button(f"查看命中原文：{citation}", key=f"basis_{level}_{index}_{evidence_index}"):
-                                    show_evidence_content(evidence)
                         st.markdown(f"**风险分析：** {item.get('issue', '')}")
                         st.markdown(f"**修改建议：** {item.get('suggested_revision', '')}")
                         if index < len(items):
@@ -1353,13 +1382,15 @@ with nullcontext():
                 st.markdown(format_report_evidence_refs(
                     report_text_for_display(st.session_state.final_report),
                     st.session_state.evidence_records,
-                ))
+                    inline_sources=True,
+                ), unsafe_allow_html=True)
         else:
             st.warning("报告未能解析成风险条目，以下显示完整原始报告。")
             st.markdown(format_report_evidence_refs(
                 report_text_for_display(st.session_state.final_report),
                 st.session_state.evidence_records,
-            ))
+                inline_sources=True,
+            ), unsafe_allow_html=True)
 
         st.markdown("<br>", unsafe_allow_html=True)
         export_col1, export_col2 = st.columns(2)

@@ -51,7 +51,12 @@ from gateway.review_orchestrator import ReviewOrchestrator
 from services.contract_rewriter import rewrite_selected_clauses
 from services.review_trace import ReviewTrace
 from gateway.model_runtime import model_runtime
-from services.pdf_kb_loader import determine_tag
+from services.pdf_kb_loader import (
+    convert_law_source_to_txt,
+    determine_tag,
+    law_text_related_files,
+    pdf_text_cache_path,
+)
 
 app = FastAPI(
     title="Legal Agent Lab API Gateway",
@@ -87,7 +92,11 @@ def _knowledge_source_paths() -> List[Path]:
         path for path in docs_dir.iterdir()
         if path.is_file()
         and path.suffix.lower() in KNOWLEDGE_FILE_EXTENSIONS
-        and not path.name.lower().endswith(".pdf.txt")
+        and not path.name.lower().endswith((".pdf.txt", ".pdf.law.txt"))
+        and (
+            path.name.lower().endswith(".law.txt")
+            or determine_tag(path.name) != "法"
+        )
     )
 
 
@@ -95,6 +104,64 @@ def _reload_knowledge_index() -> int:
     agent_instance.tool_mapping = agent_instance.tool_registry.build()
     knowledge_base = agent_instance.tool_registry.knowledge_base
     return len(getattr(knowledge_base, "pages", []) or [])
+
+
+def _editable_knowledge_source(filename: str, extensions: set[str]) -> Path:
+    if Path(filename).name != filename:
+        raise HTTPException(status_code=400, detail="无效的文件名。")
+    docs_dir = Path(agent_instance.docs_dir).resolve()
+    source = docs_dir / filename
+    if (
+        not source.is_file()
+        or source.is_symlink()
+        or source.suffix.lower() not in extensions
+        or source.name.lower().endswith((".pdf.txt", ".pdf.law.txt"))
+    ):
+        raise HTTPException(status_code=404, detail="未找到可编辑的知识库资料。")
+    if determine_tag(source.name) not in {"合规", "通用"}:
+        raise HTTPException(status_code=403, detail="仅允许编辑企业知识库和其他资料。")
+    return source
+
+
+async def _replace_knowledge_source(source: Path, content: bytes) -> int:
+    artifacts = [source.with_suffix(".articles.json")]
+    if source.suffix.lower() == ".pdf":
+        for pdf_text in {pdf_text_cache_path(source), source.with_suffix(".pdf.txt")}:
+            artifacts.extend([pdf_text, pdf_text.with_suffix(pdf_text.suffix + ".meta.json")])
+    previous_artifacts = {
+        artifact: artifact.read_bytes()
+        for artifact in artifacts
+        if artifact.is_file() and not artifact.is_symlink()
+    }
+    previous_content = source.read_bytes()
+    temporary_path = source.parent / f".kb-edit-{uuid.uuid4().hex}.tmp"
+    replaced = False
+    try:
+        temporary_path.write_bytes(content)
+        os.replace(temporary_path, source)
+        replaced = True
+        for artifact in artifacts:
+            artifact.unlink(missing_ok=True)
+        return await asyncio.to_thread(_reload_knowledge_index)
+    except (OSError, RuntimeError, ValueError) as exc:
+        if replaced:
+            rollback_path = source.parent / f".kb-rollback-{uuid.uuid4().hex}.tmp"
+            try:
+                rollback_path.write_bytes(previous_content)
+                os.replace(rollback_path, source)
+                for artifact in artifacts:
+                    if artifact in previous_artifacts:
+                        artifact.write_bytes(previous_artifacts[artifact])
+                    else:
+                        artifact.unlink(missing_ok=True)
+                await asyncio.to_thread(_reload_knowledge_index)
+            except (OSError, RuntimeError, ValueError):
+                pass
+            finally:
+                rollback_path.unlink(missing_ok=True)
+        raise HTTPException(status_code=422, detail=f"资料保存或索引失败：{exc}") from exc
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 def _knowledge_rule_book():
@@ -190,7 +257,7 @@ def view_knowledge_document(request: Request, filename: str):
         not source.is_file()
         or source.is_symlink()
         or source.suffix.lower() not in KNOWLEDGE_FILE_EXTENSIONS
-        or source.name.lower().endswith(".pdf.txt")
+        or source.name.lower().endswith((".pdf.txt", ".pdf.law.txt"))
     ):
         raise HTTPException(status_code=404, detail="未找到可查看的知识库资料。")
 
@@ -200,6 +267,42 @@ def view_knowledge_document(request: Request, filename: str):
         ".txt": "text/plain; charset=utf-8",
     }
     return FileResponse(source, media_type=media_types[source.suffix.lower()])
+
+
+@app.put("/api/v1/knowledge/document-content")
+async def update_knowledge_document_content(
+    request: Request,
+    payload: Dict[str, Any] = Body(...),
+):
+    _require_local_knowledge_admin(request)
+    source = _editable_knowledge_source(str(payload.get("filename", "")), {".txt", ".md"})
+    content = payload.get("content")
+    if not isinstance(content, str):
+        raise HTTPException(status_code=422, detail="资料内容必须是文本。")
+    encoded_content = content.encode("utf-8")
+    if len(encoded_content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"资料内容超过限制（最大 {MAX_UPLOAD_BYTES} 字节）。")
+    indexed_pages = await _replace_knowledge_source(source, encoded_content)
+    return {"filename": source.name, "indexed_pages": indexed_pages, "message": "资料已保存并重新建立索引。"}
+
+
+@app.put("/api/v1/knowledge/document-file")
+async def replace_knowledge_document_file(
+    request: Request,
+    filename: str = Form(...),
+    file: UploadFile = File(...),
+):
+    _require_local_knowledge_admin(request)
+    source = _editable_knowledge_source(filename, {".pdf"})
+    if Path(file.filename or "").suffix.lower() != ".pdf":
+        raise HTTPException(status_code=400, detail="替换文件必须是 PDF。")
+    temporary_path = source.parent / f".kb-upload-{uuid.uuid4().hex}.pdf"
+    try:
+        await save_upload_file(file, temporary_path, MAX_UPLOAD_BYTES)
+        indexed_pages = await _replace_knowledge_source(source, temporary_path.read_bytes())
+        return {"filename": source.name, "indexed_pages": indexed_pages, "message": "PDF 已替换并重新建立索引。"}
+    finally:
+        temporary_path.unlink(missing_ok=True)
 
 
 @app.post("/api/v1/knowledge/documents")
@@ -221,15 +324,32 @@ async def upload_knowledge_document(
 
     docs_dir = Path(agent_instance.docs_dir)
     docs_dir.mkdir(parents=True, exist_ok=True)
-    filename = f"{KNOWLEDGE_CATEGORY_PREFIXES[category]}_{stem}{extension}"
+    if category == "law" and stem.lower().endswith(".law"):
+        stem = stem[:-4]
+    filename = (
+        f"{KNOWLEDGE_CATEGORY_PREFIXES[category]}_{stem}.law.txt"
+        if category == "law"
+        else f"{KNOWLEDGE_CATEGORY_PREFIXES[category]}_{stem}{extension}"
+    )
     destination = docs_dir / filename
     if destination.exists():
         raise HTTPException(status_code=409, detail="同名资料已存在，请先删除旧文件或更换文件名。")
 
-    temporary_path = docs_dir / f".kb-upload-{uuid.uuid4().hex}.tmp"
+    temporary_path = docs_dir / f".kb-upload-{uuid.uuid4().hex}{extension}"
     try:
         await save_upload_file(file, temporary_path, MAX_UPLOAD_BYTES)
-        os.replace(temporary_path, destination)
+        if category == "law":
+            converted = await asyncio.to_thread(
+                convert_law_source_to_txt,
+                temporary_path,
+                destination,
+                raw_name,
+            )
+            if not converted:
+                raise HTTPException(status_code=422, detail="法规文件无法提取有效文本，未加入知识库。")
+            temporary_path.unlink(missing_ok=True)
+        else:
+            os.replace(temporary_path, destination)
         indexed_pages = await asyncio.to_thread(_reload_knowledge_index)
         return {
             "filename": filename,
@@ -241,6 +361,7 @@ async def upload_knowledge_document(
     except (OSError, RuntimeError, ValueError) as exc:
         if destination.exists():
             destination.unlink()
+        destination.with_suffix(".articles.json").unlink(missing_ok=True)
         raise HTTPException(status_code=422, detail=f"资料索引失败：{exc}") from exc
     finally:
         temporary_path.unlink(missing_ok=True)
@@ -257,14 +378,16 @@ def delete_knowledge_document(request: Request, filename: str):
         not source.is_file()
         or source.is_symlink()
         or source.suffix.lower() not in KNOWLEDGE_FILE_EXTENSIONS
-        or source.name.lower().endswith(".pdf.txt")
+        or source.name.lower().endswith((".pdf.txt", ".pdf.law.txt"))
     ):
         raise HTTPException(status_code=404, detail="未找到可管理的知识库资料。")
 
-    artifacts = [source.with_suffix(".articles.json")]
-    if source.suffix.lower() == ".pdf":
-        cache_path = source.with_suffix(".pdf.txt")
-        artifacts.extend([cache_path, cache_path.with_suffix(cache_path.suffix + ".meta.json")])
+    artifacts = {source.with_suffix(".articles.json")}
+    if source.name.lower().endswith(".law.txt"):
+        artifacts.update(law_text_related_files(source))
+    elif source.suffix.lower() == ".pdf":
+        for cache_path in {pdf_text_cache_path(source), source.with_suffix(".pdf.txt")}:
+            artifacts.update([cache_path, cache_path.with_suffix(cache_path.suffix + ".meta.json")])
     source.unlink()
     for artifact in artifacts:
         artifact.unlink(missing_ok=True)

@@ -234,7 +234,8 @@ def normalize_report_structure(
             else len(content)
         )
         section = (
-            article_context_by_heading.get(heading_index, "")
+            (content[:heading.start()] if position == 0 else "")
+            + article_context_by_heading.get(heading_index, "")
             + content[heading.end():section_end]
         )
         lines = section.splitlines()
