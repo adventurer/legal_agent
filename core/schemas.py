@@ -144,7 +144,7 @@ class ReviewRequest(BaseModel):
     max_turns: Optional[int] = Field(
         default=6, 
         ge=1, 
-        le=15, 
+        le=30,
         description="ReAct 推理最大轮次限制"
     )
     stream: Optional[bool] = Field(

@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from configs import config as app_config
+from core.schemas import ReviewRequest
 from gateway.llm_interaction.context_manager import ContextWindowManager
 from gateway.llm_interaction.react_loop import _max_output_tokens
 from gateway.llm_interaction.contracts import ModelToolCall
@@ -30,6 +31,7 @@ from core.prompts import (
     REVIEW_ANALYSIS_GUIDANCE,
     RISK_LEVEL_REPORT_LEGEND,
 )
+from core.schemas import ContractReviewReport
 from services.pdf_kb_search import search_pages
 from services.report_parser import parse_structured_report
 
@@ -52,6 +54,38 @@ def _tool_call_delta(call_id=None, name=None, arguments=None, index=0):
     )
 
 
+def _valid_report_payload(**review_overrides):
+    review = {
+        "clause_topic": "第五条 验收",
+        "risk_level": "Medium",
+        "risk_type": "商业",
+        "enterprise_risk_level": "未检索到企业内部风险等级",
+        "legal_effect": "未检索到直接依据",
+        "commercial_impact": "验收流程不明确，可能导致付款争议。",
+        "remedy_cost": "中",
+        "affected_party": "双方",
+        "confidence": "中",
+        "legal_basis": "未检索到直接依据",
+        "enterprise_basis": "未检索到相关企业规则或知识库依据",
+        "issue": "验收期限未明确。",
+        "suggested_revision": "明确验收期限。",
+    }
+    review.update(review_overrides)
+    return {"reviews": [review]}
+
+
+def _canonical_report_json(report_payload=None):
+    payload = report_payload or _valid_report_payload()
+    return ContractReviewReport.model_validate(payload).model_dump_json(ensure_ascii=False)
+
+
+def _final_report_arguments(report_payload=None, guardrails=None):
+    return json.dumps({
+        "report": report_payload or _valid_report_payload(),
+        "acknowledged_guardrails": guardrails or [],
+    }, ensure_ascii=False)
+
+
 def _agent(responses, tool_mapping=None):
     requests = []
 
@@ -71,6 +105,15 @@ def _agent(responses, tool_mapping=None):
 
 
 class ToolContractTests(unittest.TestCase):
+    def test_review_request_accepts_ui_max_turns_and_rejects_above_it(self):
+        contract = "这是用于验证最大探索步数的合同正文样例，长度超过十个字符。"
+
+        request = ReviewRequest(contract_text=contract, max_turns=30)
+
+        self.assertEqual(request.max_turns, 30)
+        with self.assertRaises(ValueError):
+            ReviewRequest(contract_text=contract, max_turns=31)
+
     def test_catalog_is_bounded_and_excludes_unavailable_tools(self):
         mapping = {
             name: (lambda query: query)
@@ -99,7 +142,17 @@ class ToolContractTests(unittest.TestCase):
         self.assertIn("不得将企业规则作为法律依据", rule_description)
         self.assertFalse(schemas[0]["function"]["parameters"]["additionalProperties"])
         self.assertIn("不得填写工具名", schemas[-1]["function"]["description"])
-        self.assertIn("必须为空数组", schemas[-1]["function"]["description"])
+        self.assertIn("可省略", schemas[-1]["function"]["description"])
+        report_parameters = schemas[-1]["function"]["parameters"]
+        self.assertNotIn("acknowledged_guardrails", report_parameters["required"])
+
+        guarded_schemas = build_tool_schemas(
+            mapping,
+            {"get_company_policy"},
+            ["unlimited_liability"],
+        )
+        guarded_required = guarded_schemas[-1]["function"]["parameters"]["required"]
+        self.assertIn("acknowledged_guardrails", guarded_required)
 
     def test_executor_validates_arguments_before_read_only_call(self):
         calls = []
@@ -209,13 +262,43 @@ class ToolContractTests(unittest.TestCase):
         call = ModelToolCall(
             call_id="final",
             name="submit_final_report",
-            arguments=json.dumps({
-                "report": "报告正文",
-                "acknowledged_guardrails": [],
-            }),
+            arguments=_final_report_arguments(),
         )
         with self.assertRaises(FinalReportValidationError):
             validate_final_report(call, ["unlimited_liability"])
+
+    def test_missing_guardrail_field_defaults_only_when_none_are_required(self):
+        report_payload = _valid_report_payload()
+        nested_report = {
+            **report_payload,
+            "acknowledged_guardrails": [],
+        }
+        call = ModelToolCall(
+            call_id="final",
+            name="submit_final_report",
+            arguments=json.dumps({"report": report_payload}, ensure_ascii=False),
+        )
+        nested_call = ModelToolCall(
+            call_id="nested-final",
+            name="submit_final_report",
+            arguments=json.dumps({"report": nested_report}, ensure_ascii=False),
+        )
+
+        submission = validate_final_report(call, [])
+        nested_submission = validate_final_report(nested_call, [])
+
+        self.assertEqual(submission.acknowledged_guardrails, [])
+        self.assertEqual(nested_submission.acknowledged_guardrails, [])
+        with self.assertRaisesRegex(
+            FinalReportValidationError,
+            "遗漏必须核实的风险标记: unlimited_liability",
+        ):
+            validate_final_report(call, ["unlimited_liability"])
+        with self.assertRaisesRegex(
+            FinalReportValidationError,
+            "遗漏必须核实的风险标记: unlimited_liability",
+        ):
+            validate_final_report(nested_call, ["unlimited_liability"])
 
 class ContextAndGuardrailTests(unittest.TestCase):
     def test_qwen_1_5b_budget_matches_its_context_and_output_ceiling(self):
@@ -622,6 +705,49 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(final["raw_report"], report)
         self.assertEqual(requests, [])
 
+    def test_finalizer_restores_authoritative_enterprise_risk_level(self):
+        report = _valid_report_payload(
+            enterprise_risk_level="Low",
+            enterprise_basis="规则库 [[RULE:RULE7]]",
+        )
+        agent, _ = _agent(iter([]))
+        recorder = ToolCallRecorder("authoritative-enterprise-grade")
+        recorder.record_call(1, "call_rule", "get_past_review_rules", "{}")
+        recorder.record_result(
+            "call_rule",
+            json.dumps({"evidence": [{
+                "id": "RULE7",
+                "source_type": "enterprise_rule",
+                "enterprise_risk_level": "High",
+            }]}, ensure_ascii=False),
+            True,
+            0,
+        )
+
+        async def collect():
+            return [event async for event in ReportFinalizer(agent).finalize(
+                report=json.dumps(report, ensure_ascii=False),
+                contract_text="合同条款内容",
+                task_id="authoritative-enterprise-grade",
+                turn=1,
+                acknowledged_guardrails=[],
+                finish_reason="tool_calls",
+                tool_call_records=recorder,
+            )]
+
+        events = asyncio.run(collect())
+        final = next(
+            json.loads(event["data"])
+            for event in events
+            if event["event"] == "final_report"
+        )
+        final_report = json.loads(final["raw_report"])
+        self.assertEqual(
+            final_report["reviews"][0]["enterprise_risk_level"],
+            "High",
+        )
+        self.assertEqual(final_report["reviews"][0]["risk_level"], "Medium")
+
     def test_finalizer_passes_through_report_without_rule_reconciliation(self):
         report = f"""{RISK_LEVEL_REPORT_LEGEND}
 
@@ -790,11 +916,11 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(requests, [])
 
     def test_native_tool_call_returns_role_tool_then_structured_final(self):
-        report = "建议明确付款期限。"
-        report_arguments = json.dumps({
-            "report": report,
-            "acknowledged_guardrails": [],
-        }, ensure_ascii=False)
+        report_payload = _valid_report_payload(
+            suggested_revision="建议明确付款期限。"
+        )
+        report = _canonical_report_json(report_payload)
+        report_arguments = _final_report_arguments(report_payload)
         split = report_arguments.index("付款") + 3
         responses = iter([
             [
@@ -841,19 +967,14 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(len(model_tool_calls), 2)
         self.assertEqual(model_tool_calls[0]["arguments"], '{"query":"付款期限"}')
         self.assertEqual(model_tool_calls[1]["tool"], "submit_final_report")
-        self.assertIn(report, model_tool_calls[1]["arguments"])
+        submitted_report = json.loads(model_tool_calls[1]["arguments"])["report"]
+        self.assertEqual(
+            submitted_report["reviews"][0]["suggested_revision"],
+            "建议明确付款期限。",
+        )
         self.assertEqual(names[-2:], ["final_report", "done"])
         self.assertEqual(names.count("tool_start"), 1)
         self.assertEqual(names.count("tool_result"), 1)
-        self.assertEqual(
-            "".join(item["token"] for item in payloads if item.get("token") and "report_token" in names),
-            report,
-        )
-        report_tokens = [
-            json.loads(item["data"])["token"]
-            for item in events if item["event"] == "report_token"
-        ]
-        self.assertEqual("".join(report_tokens), report)
         self.assertEqual(payloads[-2]["raw_report"], report)
         self.assertEqual(
             requests[0]["tool_choice"],
@@ -894,8 +1015,34 @@ class ReActLoopTests(unittest.TestCase):
             },
         )
 
+    def test_authoritative_grade_is_pinned_when_model_risk_review_is_disabled(self):
+        evidence = {
+            "RULE7": {
+                "source_type": "enterprise_rule",
+                "title": "付款周期规则",
+                "enterprise_risk_level": "High",
+                "text": "风险等级: High\n付款周期不得超过 30 日。",
+            }
+        }
+
+        with patch.dict(
+            app_config.AGENT_CONFIG,
+            {"llm_risk_level_review_enabled": False},
+        ):
+            guidance = ReactLoop._enterprise_evidence_guidance(evidence)
+
+        pinned_records = json.loads(guidance.split("\n", 1)[1])
+        self.assertEqual(pinned_records[0]["enterprise_risk_level"], "High")
+        self.assertNotIn("risk_level", pinned_records[0])
+        self.assertNotIn("风险等级: High", pinned_records[0]["text"])
+
     def test_finalization_preserves_model_report_with_enterprise_evidence(self):
-        report = "### 8.2 仲裁管辖约定\n- **风险等级**: 中风险"
+        report_payload = _valid_report_payload(
+            clause_topic="8.2 仲裁管辖约定",
+            risk_level="High",
+            legal_basis="[[RULE:RULE3]]",
+        )
+        report = _canonical_report_json(report_payload)
         rule_evidence = {
             "evidence": [{
                 "id": "RULE3",
@@ -918,7 +1065,7 @@ class ReActLoopTests(unittest.TestCase):
                 "final",
                 "submit_final_report",
                 json.dumps({
-                    "report": report,
+                    "report": report_payload,
                     "acknowledged_guardrails": [],
                 }, ensure_ascii=False),
             )], finish_reason="tool_calls")],
@@ -947,7 +1094,10 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(tool_result["enterprise_risk_levels"], {"RULE3": "High"})
         self.assertEqual(tool_result["high_risk_evidence_ids"], ["RULE3"])
         self.assertNotIn("纳入对应风险等级的审查处置路径", requests[1]["messages"][-1]["content"])
-        self.assertNotIn("High", requests[1]["messages"][-1]["content"])
+        self.assertIn(
+            '"enterprise_risk_level": "High"',
+            requests[1]["messages"][-1]["content"],
+        )
         self.assertEqual(
             [payload["stage"] for item, payload in zip(events, payloads)
              if item["event"] == "pipeline_stage"],
@@ -980,7 +1130,7 @@ class ReActLoopTests(unittest.TestCase):
         ] + [[_chunk(tool_calls=[_tool_call_delta(
             "call_final",
             "submit_final_report",
-            '{"report":"覆盖全部检索源","acknowledged_guardrails":[]}',
+            _final_report_arguments(),
         )], finish_reason="tool_calls")]])
         mapping = {
             name: (lambda query: json.dumps({"evidence": []}))
@@ -1047,7 +1197,7 @@ class ReActLoopTests(unittest.TestCase):
             _chunk(tool_calls=[_tool_call_delta(
                 "premature_final",
                 "submit_final_report",
-                '{"report":"过早报告","acknowledged_guardrails":[]}',
+                _final_report_arguments(_valid_report_payload(issue="过早报告")),
             )], finish_reason="tool_calls")
         ]] + [[_chunk(tool_calls=[_tool_call_delta(
             f"call_{name}", name, json.dumps({"query": f"查询 {name}"})
@@ -1055,7 +1205,7 @@ class ReActLoopTests(unittest.TestCase):
             tool_calls=[_tool_call_delta(
                 "call_final",
                 "submit_final_report",
-                '{"report":"覆盖后报告","acknowledged_guardrails":[]}',
+                _final_report_arguments(_valid_report_payload(issue="覆盖后报告")),
             )],
             finish_reason="tool_calls",
         )]])
@@ -1093,7 +1243,7 @@ class ReActLoopTests(unittest.TestCase):
             [_chunk(tool_calls=[_tool_call_delta(
                 "good_final",
                 "submit_final_report",
-                '{"report":"有效报告","acknowledged_guardrails":[]}',
+                _final_report_arguments(),
             )], finish_reason="tool_calls")],
         ])
         agent, requests = _agent(responses)
@@ -1116,7 +1266,7 @@ class ReActLoopTests(unittest.TestCase):
                 "bad_guardrails",
                 "submit_final_report",
                 json.dumps({
-                    "report": "审查报告",
+                    "report": _valid_report_payload(),
                     "acknowledged_guardrails": ["get_company_policy", "search_civil_code"],
                 }),
             )], finish_reason="tool_calls")],
@@ -1124,7 +1274,7 @@ class ReActLoopTests(unittest.TestCase):
                 "corrected_final",
                 "submit_final_report",
                 json.dumps({
-                    "report": "审查报告",
+                    "report": _valid_report_payload(),
                     "acknowledged_guardrails": [],
                 }),
             )], finish_reason="tool_calls")],
@@ -1192,7 +1342,7 @@ class ReActLoopTests(unittest.TestCase):
             [_chunk(tool_calls=[_tool_call_delta(
                 "complete_final",
                 "submit_final_report",
-                '{"report":"补全后的有效报告","acknowledged_guardrails":[]}',
+                _final_report_arguments(),
             )], finish_reason="tool_calls")],
         ])
         agent, requests = _agent(responses)
@@ -1224,7 +1374,7 @@ class ReActLoopTests(unittest.TestCase):
             )], finish_reason="tool_calls")],
             [_chunk(tool_calls=[_tool_call_delta(
                 "final", "submit_final_report",
-                '{"report":"已基于现有资料完成","acknowledged_guardrails":[]}'
+                _final_report_arguments()
             )], finish_reason="tool_calls")],
         ])
         executed_queries = []
@@ -1248,9 +1398,11 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(events[-2]["event"], "final_report")
 
     def test_prefaced_plain_text_final_finishes_without_repeat_submission(self):
+        report_payload = _valid_report_payload()
+        report_json = _canonical_report_json(report_payload)
         responses = iter([
             [_chunk(
-                content="最终报告如下：\n### 审查结论\n建议明确仲裁条款。",
+                content="最终报告如下：\n" + json.dumps(report_payload, ensure_ascii=False),
                 finish_reason="stop",
             )],
         ])
@@ -1266,7 +1418,7 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual([item["event"] for item in events][-2:], ["final_report", "done"])
         final = json.loads(events[-2]["data"])
         self.assertTrue(final["is_complete"])
-        self.assertEqual(final["raw_report"], "### 审查结论\n建议明确仲裁条款。")
+        self.assertEqual(final["raw_report"], report_json)
 
     def test_iteration_limit_never_returns_success(self):
         responses = iter([[_chunk(content="请继续", finish_reason="stop")]])

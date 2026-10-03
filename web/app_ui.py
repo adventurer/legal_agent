@@ -31,10 +31,12 @@ import streamlit as st
 from markdown_it import MarkdownIt
 import httpx
 from core.prompts import RISK_LEVEL_REPORT_LEGEND
+from core.schemas import ContractReviewReport
 from services.report_parser import (
     clean_report_content,
     normalize_report_structure,
     parse_structured_report,
+    render_report_article,
 )
 from services.review_execution import (
     execute_review_unit,
@@ -613,7 +615,7 @@ with nullcontext():
         )
 
     with ctrl_col3:
-        max_turns = st.slider("每轮最大探索步数", min_value=3, max_value=30, value=10, step=1)
+        max_turns = st.slider("每轮最大探索步数", min_value=10, max_value=30, value=10, step=1)
 
     with ctrl_col4:
         review_side = st.selectbox(
@@ -740,10 +742,23 @@ with nullcontext():
                     st.session_state.revised_contract_signature = None
                     with st.spinner("正在按选中条款生成修订合同..."):
                         try:
+                            review_article = (
+                                render_report_article(
+                                    ContractReviewReport.model_validate(
+                                        st.session_state.structured_report
+                                    )
+                                )
+                                if st.session_state.structured_report
+                                else st.session_state.final_report
+                            )
+                            review_article = format_report_evidence_refs(
+                                review_article,
+                                st.session_state.evidence_records,
+                            )
                             st.session_state.revised_contract = rewrite_contract(
                                 API_BASE_URL,
                                 st.session_state.clauses,
-                                st.session_state.final_report,
+                                review_article,
                                 selected_revision_indices,
                             )
                             st.session_state.revised_contract_signature = revision_signature
@@ -1196,16 +1211,18 @@ def execute_concurrent_clause_review(
         overall_status = "并发审查失败"
     st.session_state.review_flow["status"] = overall_status
     results.sort(key=lambda x: x["index"])
-    aggregated_reports = [
-        (
-            f"### 条款 {result['index']}: {result['title']}\n\n"
-            f"{result['report'] if result['success'] else '审查失败，未生成有效报告：' + result['error']}\n\n---"
-        )
-        for result in results
-    ]
+    aggregated_reviews = []
+    for result in results:
+        if not result["success"]:
+            continue
+        parsed_report = parse_structured_report(result["report"])
+        if parsed_report:
+            aggregated_reviews.extend(
+                item.model_dump(mode="json") for item in parsed_report.reviews
+            )
 
     st.session_state.is_reviewing = False
-    return f"# 综合合同审查终审报告（{overall_status}）\n\n" + "\n\n".join(aggregated_reports)
+    return json.dumps({"reviews": aggregated_reviews}, ensure_ascii=False)
 
 
 # ==================== 8. 下部：审查轨迹与展示 ====================
@@ -1224,7 +1241,7 @@ with nullcontext():
                 review_side=review_side,
             )
             if report:
-                st.session_state.final_report = f"## 针对【{target_clause['title']}】的专属审查意见\n\n" + report
+                st.session_state.final_report = report
                 st.rerun()
 
     elif start_full_review:
@@ -1305,7 +1322,7 @@ with nullcontext():
             if parsed_report:
                 st.session_state.structured_report = parsed_report.model_dump(mode="json")
         structured_reviews = (st.session_state.structured_report or {}).get("reviews", [])
-        if structured_reviews:
+        if st.session_state.structured_report is not None:
             st.caption(
                 "按法律效力、商业后果、救济成本及所选审查立场综合分级；纯执行能力要求归为提示。"
             )
@@ -1396,26 +1413,14 @@ with nullcontext():
                         if index < len(items):
                             st.divider()
             with st.expander("查看完整审查报告"):
-                json_tab, markdown_tab = st.tabs(["结构化 JSON", "原始 Markdown"])
-                with json_tab:
-                    report_json = json.loads(json.dumps(st.session_state.structured_report))
-                    for review in report_json.get("reviews", []):
-                        for field in ("legal_basis", "enterprise_basis"):
-                            if review.get(field):
-                                review[field] = format_report_evidence_refs(
-                                    review[field], st.session_state.evidence_records
-                                )
-                    st.code(
-                        json.dumps(report_json, ensure_ascii=False, indent=2),
-                        language="json",
-                        wrap_lines=True,
-                    )
-                with markdown_tab:
-                    st.code(
-                        report_text_for_display(st.session_state.final_report),
-                        language="markdown",
-                        wrap_lines=True,
-                    )
+                report_model = ContractReviewReport.model_validate(
+                    st.session_state.structured_report
+                )
+                report_article = format_report_evidence_refs(
+                    render_report_article(report_model),
+                    st.session_state.evidence_records,
+                )
+                st.markdown(report_article)
         else:
             st.warning("报告未能解析成风险条目，以下显示完整原始报告。")
             st.code(
@@ -1427,8 +1432,14 @@ with nullcontext():
         st.markdown("<br>", unsafe_allow_html=True)
         export_col1, export_col2 = st.columns(2)
         export_filename = f"contract_review_{int(time.time())}"
+        if st.session_state.structured_report:
+            export_source = render_report_article(
+                ContractReviewReport.model_validate(st.session_state.structured_report)
+            )
+        else:
+            export_source = report_text_for_display(st.session_state.final_report)
         readable_report = format_report_evidence_refs(
-            report_text_for_display(st.session_state.final_report),
+            export_source,
             st.session_state.evidence_records,
         )
         with export_col1:

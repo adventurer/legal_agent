@@ -176,7 +176,7 @@ class ContractReviewAgent:
             reply = "".join(reply_chunks).strip()
             print()
 
-            # 1. 优先检测是否达成 Final 报告，同时兼容模型漏写 Final: 的 Markdown 输出
+            # 1. 优先检测是否达成 Final 报告，同时兼容漏写 Final: 的 JSON/Markdown 输出
             is_final, raw_report, parsed_report = split_final_output(reply)
             if is_final:
                 print("\n>>> 审查完成，正在解析结构化报告！", flush=True)

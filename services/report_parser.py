@@ -63,7 +63,13 @@ def is_final_report(text: str) -> bool:
         "Final:", "【最终结论】", "最终审查意见", "综合审查报告", "最终报告如下",
     )):
         return True
-    return sum(signature in text for signature in REPORT_SIGNATURES) >= 2
+    if sum(signature in text for signature in REPORT_SIGNATURES) >= 2:
+        return True
+    try:
+        payload = json.loads(clean_report_content(text))
+    except (json.JSONDecodeError, TypeError):
+        return False
+    return isinstance(payload, dict) and isinstance(payload.get("reviews"), list)
 
 
 def clean_report_content(raw_text: str) -> str:
@@ -79,7 +85,7 @@ def clean_report_content(raw_text: str) -> str:
     # 模型可能把合同原文嵌套在 ```markdown ... ``` 中。只移除围栏行，
     # 不删除围栏内的合同内容，避免 UI 将 Markdown 控制标记直接展示给用户。
     cleaned = re.sub(
-        r"(?im)^[ \t]*```[ \t]*(?:markdown|md|text)?[ \t]*\r?$",
+        r"(?im)^[ \t]*```[ \t]*(?:json|markdown|md|text)?[ \t]*\r?$",
         "",
         cleaned,
     )
@@ -357,6 +363,48 @@ def parse_structured_report(raw_text: str) -> Optional[ContractReviewReport]:
         return ContractReviewReport.model_validate({"reviews": reviews})
     except (TypeError, ValueError):
         return None
+
+
+def render_report_article(report: ContractReviewReport) -> str:
+    """Render structured report data as a readable Markdown article."""
+    risk_labels = {
+        "High": "高风险",
+        "Medium": "中风险",
+        "Low": "低风险",
+        "Notice": "履约/商务提示",
+    }
+    sections = ["# 合同审查报告", "", RISK_LEVEL_REPORT_LEGEND]
+    if not report.reviews:
+        sections.extend(["", "未生成条款审查条目。"])
+        return "\n\n".join(sections)
+
+    for index, item in enumerate(report.reviews, start=1):
+        risk_level = getattr(item.risk_level, "value", item.risk_level)
+        fields = (
+            ("风险类型", item.risk_type),
+            ("风险等级", risk_labels.get(str(risk_level), str(risk_level))),
+            ("企业内部风险等级", item.enterprise_risk_level or "未检索到企业内部风险等级"),
+            ("法律效力", item.legal_effect),
+            ("商业后果", item.commercial_impact),
+            ("救济成本", item.remedy_cost),
+            ("受影响方", item.affected_party),
+            ("结论置信度", item.confidence),
+            ("法律/合规依据", item.legal_basis or "未检索到直接依据"),
+            (
+                "企业知识库依据",
+                item.enterprise_basis or "未检索到相关企业规则或知识库依据",
+            ),
+            ("风险剖析", item.issue),
+            ("修改建议", item.suggested_revision),
+        )
+        lines = [f"## {index}. {item.clause_topic}"]
+        for label, value in fields:
+            if value is None or not str(value).strip():
+                continue
+            formatted_value = str(value).strip().replace("\r\n", "\n").replace("\n", "\n  ")
+            lines.append(f"- **{label}**: {formatted_value}")
+        sections.append("\n".join(lines))
+    return "\n\n".join(sections)
 
 
 def split_final_output(raw_text: str) -> Tuple[bool, str, Optional[ContractReviewReport]]:

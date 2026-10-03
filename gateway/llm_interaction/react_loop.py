@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator, Dict
 from starlette.concurrency import iterate_in_threadpool
 
 from configs.config import AGENT_CONFIG
-from services.report_parser import clean_report_content, is_final_report
+from services.report_parser import clean_report_content, parse_structured_report
 
 from .context_manager import ContextWindowError, ContextWindowManager
 from .contracts import ToolExecutionResult
@@ -99,7 +99,7 @@ class ReactLoop:
                 "text": text,
                 **({
                     "enterprise_risk_level": item.get("enterprise_risk_level"),
-                } if include_risk_levels and item.get("enterprise_risk_level") else {}),
+                } if item.get("enterprise_risk_level") else {}),
             })
         candidates.sort(
             key=lambda item: item["source_type"] != "enterprise_rule"
@@ -118,13 +118,14 @@ class ReactLoop:
                 "text": item["text"][:text_limit],
             }
             if item.get("enterprise_risk_level"):
-                record["risk_level"] = item["enterprise_risk_level"]
+                record["enterprise_risk_level"] = item["enterprise_risk_level"]
             records.append(record)
             remaining_text_chars -= min(len(item["text"]), text_limit)
         if not records:
             return ""
         return (
             "【必须遵守】以下企业证据由工具实际返回。合同涉及规则事项即适用，即使条款违反规则；"
+            "enterprise_risk_level 是工具查到的企业内部风险等级，必须在报告中原样照录，不得改写、翻译或推断；"
             "企业依据须引用精确 reference，并依规则标准提出修改建议；法律依据与企业依据分开。"
             "不得称未检索到规则或编造编号。\n"
             + json.dumps(records, ensure_ascii=False)
@@ -469,13 +470,18 @@ class ReactLoop:
                             else:
                                 recorder.record_result(
                                     call.call_id,
-                                    json.dumps({"report": submission.report}, ensure_ascii=False),
+                                    json.dumps(
+                                        {"report": submission.report.model_dump(mode="json")},
+                                        ensure_ascii=False,
+                                    ),
                                     True,
                                     int((perf_counter() - started) * 1000),
                                 )
                                 finalizer = ReportFinalizer(self.agent)
                                 async for event in finalizer.finalize(
-                                    report=submission.report,
+                                    report=submission.report.model_dump_json(
+                                        ensure_ascii=False
+                                    ),
                                     contract_text=contract_text,
                                     task_id=task_label,
                                     turn=turn,
@@ -584,10 +590,11 @@ class ReactLoop:
                 })
                 return
             final_report_text = clean_report_content(content)
-            if final_report_text and is_final_report(content):
+            parsed_report = parse_structured_report(final_report_text)
+            if parsed_report:
                 finalizer = ReportFinalizer(self.agent)
                 async for event in finalizer.finalize(
-                    report=final_report_text,
+                    report=parsed_report.model_dump_json(ensure_ascii=False),
                     contract_text=contract_text,
                     task_id=task_label,
                     turn=turn,

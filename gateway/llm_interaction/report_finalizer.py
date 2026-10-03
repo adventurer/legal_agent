@@ -373,6 +373,35 @@ class ReportFinalizer:
                 supplements[topic] = values
         return supplements
 
+    @staticmethod
+    def _enforce_enterprise_risk_levels(
+        report: str,
+        evidence: Dict[str, Dict[str, Any]],
+    ) -> str:
+        parsed = parse_structured_report(report)
+        if not parsed:
+            return report
+
+        changed = False
+        for review in parsed.reviews:
+            cited_rule_ids = re.findall(
+                r"\[\[RULE:(RULE\d+)\]\]",
+                review.enterprise_basis or "",
+            )
+            grades = list(dict.fromkeys(
+                str(record["enterprise_risk_level"])
+                for rule_id in cited_rule_ids
+                if (record := evidence.get(rule_id))
+                and record.get("source_type") == "enterprise_rule"
+                and record.get("enterprise_risk_level")
+            ))
+            if grades:
+                authoritative_grade = "、".join(grades)
+                if review.enterprise_risk_level != authoritative_grade:
+                    review.enterprise_risk_level = authoritative_grade
+                    changed = True
+        return parsed.model_dump_json(ensure_ascii=False) if changed else report
+
     async def finalize(
         self,
         report: str,
@@ -383,6 +412,10 @@ class ReportFinalizer:
         finish_reason: str | None,
         tool_call_records: ToolCallRecorder,
     ) -> AsyncGenerator[Dict[str, str], None]:
+        report = self._enforce_enterprise_risk_levels(
+            report,
+            tool_call_records.evidence_records(),
+        )
         call_count = len(tool_call_records.snapshot()["calls"])
         yield encode_event("pipeline_stage", {
             "task_id": task_id,

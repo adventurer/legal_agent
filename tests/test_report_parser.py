@@ -3,12 +3,41 @@ import unittest
 from core.prompts import RISK_LEVEL_REPORT_LEGEND
 from services.report_parser import (
     normalize_report_structure,
+    is_final_report,
     parse_structured_report,
+    render_report_article,
     validate_report_structure,
 )
 
 
 class ReportParserTests(unittest.TestCase):
+    def test_renders_json_report_as_readable_markdown_article(self):
+        report = parse_structured_report(
+            '{"reviews":[{"clause_topic":"第五条 验收","risk_level":"High",'
+            '"legal_basis":"依据 [[EVIDENCE:EV1]]","issue":"验收机制不明确。",'
+            '"suggested_revision":"补充验收期限。"}]}'
+        )
+
+        article = render_report_article(report)
+
+        self.assertIn("# 合同审查报告", article)
+        self.assertIn("## 1. 第五条 验收", article)
+        self.assertIn("**风险等级**: 高风险", article)
+        self.assertIn("**风险剖析**: 验收机制不明确。", article)
+        self.assertIn("[[EVIDENCE:EV1]]", article)
+
+    def test_parses_json_report_inside_json_code_fence(self):
+        raw_report = (
+            '```json\n{"reviews":[{"clause_topic":"第五条 验收",'
+            '"risk_level":"Low","legal_basis":"无直接依据",'
+            '"issue":"期限不明确。","suggested_revision":"补充期限。"}]}\n```'
+        )
+        report = parse_structured_report(raw_report)
+
+        self.assertIsNotNone(report)
+        self.assertEqual(report.reviews[0].clause_topic, "第五条 验收")
+        self.assertTrue(is_final_report(raw_report))
+
     def test_normalizes_heading_fields_and_common_affected_party_typo(self):
         raw_report = """# 第五条 服务保障
 

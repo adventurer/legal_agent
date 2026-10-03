@@ -2,7 +2,9 @@
 
 from typing import Optional
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from core.schemas import ContractReviewReport
 
 
 class StrictModel(BaseModel):
@@ -32,16 +34,14 @@ class ModelToolCall(StrictModel):
 
 
 class FinalReportArguments(StrictModel):
-    report: str = Field(min_length=1, max_length=30000)
-    acknowledged_guardrails: list[str] = Field(max_length=8)
+    report: ContractReviewReport
+    acknowledged_guardrails: list[str] = Field(default_factory=list, max_length=8)
 
-    @field_validator("report")
-    @classmethod
-    def strip_report(cls, value: str) -> str:
-        value = value.strip()
-        if not value:
-            raise ValueError("report 不能为空")
-        return value
+    @model_validator(mode="after")
+    def limit_report_size(self):
+        if len(self.report.model_dump_json(ensure_ascii=False)) > 30000:
+            raise ValueError("report 超过 30000 字符")
+        return self
 
     @field_validator("acknowledged_guardrails")
     @classmethod

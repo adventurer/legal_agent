@@ -49,17 +49,18 @@ def build_tool_schemas(
     guardrail_schema["maxItems"] = len(guardrails)
     if guardrails:
         guardrail_schema["items"]["enum"] = guardrails
+        final_parameters.setdefault("required", []).append("acknowledged_guardrails")
     guardrail_instruction = (
         f"本次允许的程序规则代码：{', '.join(guardrails)}。"
         if guardrails else
-        "本次没有程序规则代码，acknowledged_guardrails 必须为空数组。"
+        "本次没有程序规则代码，acknowledged_guardrails 可省略（按空数组处理）或传空数组。"
     )
     schemas.append({
         "type": "function",
         "function": {
             "name": FINAL_REPORT_TOOL_NAME,
             "description": (
-                "提交最终合同审查报告。报告使用 Markdown；"
+                "提交最终合同审查报告。report 是顶层的 JSON 对象；acknowledged_guardrails 是与 report 同级的顶层数组，不能放进 report 内；"
                 "acknowledged_guardrails 只能包含程序规则代码，不得填写工具名、证据编号或法规编号；"
                 f"{guardrail_instruction}"
             ),
