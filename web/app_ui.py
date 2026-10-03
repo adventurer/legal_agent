@@ -168,6 +168,14 @@ def check_gateway_health() -> Dict[str, Any]:
         return {"status": "unreachable"}
 
 
+def reset_contract_revision_state() -> None:
+    for key in list(st.session_state.keys()):
+        if key.startswith("rewrite_clause_"):
+            st.session_state.pop(key, None)
+    st.session_state.revised_contract = None
+    st.session_state.revised_contract_signature = None
+
+
 def start_gateway_process() -> subprocess.Popen:
     """Start the local API gateway from the Streamlit process."""
     global _gateway_process
@@ -622,6 +630,7 @@ with nullcontext():
                 {"index": 2, "type": "article", "title": "第一条 交付期限与违约金", "content": "乙方逾期交付的，每日应按合同总金额的 5% 向甲方支付惩罚性违约金。"},
                 {"index": 3, "type": "article", "title": "第二条 争议管辖与独任仲裁", "content": "因本合同发生的一切争议，由甲方指定的独任仲裁员在其个人办公场所秘密裁决，裁决为终局。"}
             ]
+            reset_contract_revision_state()
             st.session_state.clauses = sample_clauses
             st.session_state.full_contract_text = "\n\n".join([f"{c['title']}\n{c['content']}" for c in sample_clauses])
             st.session_state.final_report = ""
@@ -655,6 +664,7 @@ with nullcontext():
                 res = upload_contract_file(uploaded_file, st.session_state.session_id)
                 if res and res.get("code") == 200:
                     data = res["data"]
+                    reset_contract_revision_state()
                     st.session_state.session_id = data["session_id"]
                     st.session_state.clauses = data["clauses"]
                     st.session_state.full_contract_text = "\n\n".join([f"{c['title']}\n{c['content']}" for c in data["clauses"]])
@@ -711,19 +721,23 @@ with nullcontext():
                 for c in st.session_state.clauses
                 if st.session_state.get(f"rewrite_clause_{c.get('index')}", False)
             ]
+            revision_signature = (
+                tuple(selected_revision_indices),
+                st.session_state.final_report,
+            )
             if not st.session_state.final_report:
                 st.info("完成合同审查后，可在此选择条款并生成修订合同。")
             elif not selected_revision_indices:
                 st.warning("请选择至少一个“纳入合同修订”的条款。")
             else:
-                revision_signature = (
-                    tuple(selected_revision_indices),
-                    st.session_state.final_report,
-                )
-                if (
-                    st.session_state.revised_contract_signature
-                    != revision_signature
+                if st.button(
+                    "根据选中条款和审查意见生成修订合同",
+                    key="generate_revised_contract",
+                    type="primary",
+                    disabled=st.session_state.is_reviewing,
                 ):
+                    st.session_state.revised_contract = None
+                    st.session_state.revised_contract_signature = None
                     with st.spinner("正在按选中条款生成修订合同..."):
                         try:
                             st.session_state.revised_contract = rewrite_contract(
@@ -737,7 +751,10 @@ with nullcontext():
                         except Exception as exc:
                             st.error(f"生成修订合同失败: {exc}")
 
-            if st.session_state.revised_contract:
+            if (
+                st.session_state.revised_contract
+                and st.session_state.revised_contract_signature == revision_signature
+            ):
                 st.markdown("#### 📝 修订文本草稿预览")
                 st.text_area(
                     "修订文本草稿正文",
@@ -1378,19 +1395,34 @@ with nullcontext():
                         st.markdown(f"**修改建议：** {item.get('suggested_revision', '')}")
                         if index < len(items):
                             st.divider()
-            with st.expander("查看完整原始审查报告"):
-                st.markdown(format_report_evidence_refs(
-                    report_text_for_display(st.session_state.final_report),
-                    st.session_state.evidence_records,
-                    inline_sources=True,
-                ), unsafe_allow_html=True)
+            with st.expander("查看完整审查报告"):
+                json_tab, markdown_tab = st.tabs(["结构化 JSON", "原始 Markdown"])
+                with json_tab:
+                    report_json = json.loads(json.dumps(st.session_state.structured_report))
+                    for review in report_json.get("reviews", []):
+                        for field in ("legal_basis", "enterprise_basis"):
+                            if review.get(field):
+                                review[field] = format_report_evidence_refs(
+                                    review[field], st.session_state.evidence_records
+                                )
+                    st.code(
+                        json.dumps(report_json, ensure_ascii=False, indent=2),
+                        language="json",
+                        wrap_lines=True,
+                    )
+                with markdown_tab:
+                    st.code(
+                        report_text_for_display(st.session_state.final_report),
+                        language="markdown",
+                        wrap_lines=True,
+                    )
         else:
             st.warning("报告未能解析成风险条目，以下显示完整原始报告。")
-            st.markdown(format_report_evidence_refs(
+            st.code(
                 report_text_for_display(st.session_state.final_report),
-                st.session_state.evidence_records,
-                inline_sources=True,
-            ), unsafe_allow_html=True)
+                language="markdown",
+                wrap_lines=True,
+            )
 
         st.markdown("<br>", unsafe_allow_html=True)
         export_col1, export_col2 = st.columns(2)
