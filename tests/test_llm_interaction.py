@@ -443,9 +443,13 @@ class PromptAlignmentTests(unittest.TestCase):
 
         self.assertIn(REVIEW_ANALYSIS_GUIDANCE, system_prompt)
         self.assertIn(REPORT_OUTPUT_GUIDANCE, system_prompt)
+        self.assertIn(RISK_LEVEL_REPORT_LEGEND, system_prompt)
         self.assertIn("逾期 30 日", system_prompt)
         self.assertIn("违反规则应报告为风险，不能因此判为不适用", system_prompt)
         self.assertIn("不得写成“未检索到相关企业规则”", system_prompt)
+        self.assertIn("Notice 报告必须有实质内容", system_prompt)
+        self.assertIn("责任人、完成节点", system_prompt)
+        self.assertIn("不得仅因法律检索无结果或证据不足就标为 Notice", system_prompt)
         self.assertIn("[[EVIDENCE:EV编号]]", system_prompt)
         self.assertIn("submit_final_report", system_prompt)
         self.assertIn("不得填写工具名", system_prompt)

@@ -1303,8 +1303,8 @@ with nullcontext():
                 st.session_state.structured_report = parsed_report.model_dump(mode="json")
         structured_reviews = (st.session_state.structured_report or {}).get("reviews", [])
         if st.session_state.structured_report is not None:
-            st.caption(
-                "按法律效力、商业后果、救济成本及所选审查立场综合分级；纯执行能力要求归为提示。"
+            st.warning(
+                "按法律效力、商业后果、救济成本及所选审查立场综合分级；中风险及以上为审查红线；商务提示需要衡量履约能力。低风险区企业内部风险等级为高时需要重点关注！"
             )
             risk_levels = [
                 ("High", "高风险"),
