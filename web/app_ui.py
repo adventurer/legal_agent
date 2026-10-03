@@ -62,6 +62,8 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+    [data-testid="stAppDeployButton"] { display: none !important; }
+    [data-testid="stHeader"] { position: static !important; }
     [data-testid="stSidebar"] { display: none !important; }
     @media (max-width: 768px) {
         [data-testid="stSidebar"] { display: block !important; }
@@ -74,14 +76,15 @@ st.markdown("""
     .main-header {
         font-size: 1.8rem;
         font-weight: 700;
-        color: #1E293B;
+        color: inherit;
         margin-top: 0.1rem;
         margin-bottom: 0.2rem;
         line-height: 1.3;
     }
     .sub-header {
         font-size: 0.92rem;
-        color: #64748B;
+        color: inherit;
+        opacity: 0.72;
         margin-bottom: 0.8rem;
     }
     .top-control-panel {
@@ -464,7 +467,7 @@ def format_report_evidence_refs(
 # ==================== 4. 顶部控制栏 ====================
 header_col, status_col = st.columns([3, 1])
 with header_col:
-    st.markdown('<div class="main-header">⚖️ 本地法务合同审查 Agent 工作台</div>', unsafe_allow_html=True)
+    st.markdown('<div class="main-header">本地法务合同审查 Agent 工作台</div>', unsafe_allow_html=True)
     st.markdown('<div class="sub-header">全宽自适应可视 · 层次化条款切片 · 思考流追踪 · 结构化审查报告</div>', unsafe_allow_html=True)
 
 with status_col:
