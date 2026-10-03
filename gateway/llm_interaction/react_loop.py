@@ -37,17 +37,6 @@ class ReactLoop:
         self.agent = agent
 
     @staticmethod
-    def _enterprise_risk_evidence(
-        evidence: Dict[str, Dict[str, Any]],
-    ) -> Dict[str, str]:
-        return {
-            evidence_id: risk_level
-            for evidence_id, item in evidence.items()
-            if item.get("source_type") == "enterprise_rule"
-            and (risk_level := str(item.get("enterprise_risk_level", "")).strip())
-        }
-
-    @staticmethod
     def _without_enterprise_risk_levels(observation: str) -> str:
         try:
             payload = json.loads(observation)
@@ -75,22 +64,18 @@ class ReactLoop:
     def _enterprise_evidence_guidance(
         evidence: Dict[str, Dict[str, Any]],
     ) -> str:
-        include_risk_levels = AGENT_CONFIG.get(
-            "llm_risk_level_review_enabled", False
-        )
         candidates = []
         for evidence_id, item in evidence.items():
             source_type = item.get("source_type")
             if source_type not in {"enterprise_rule", "enterprise_document"}:
                 continue
             text = str(item.get("text") or "")
-            if not include_risk_levels:
-                text = "\n".join(
-                    line for line in text.splitlines()
-                    if not line.lstrip().startswith((
-                        "风险级别:", "风险级别：", "风险等级:", "风险等级：",
-                    ))
-                )
+            text = "\n".join(
+                line for line in text.splitlines()
+                if not line.lstrip().startswith((
+                    "风险级别:", "风险级别：", "风险等级:", "风险等级：",
+                ))
+            )
             reference_type = "RULE" if source_type == "enterprise_rule" else "KB"
             candidates.append({
                 "source_type": source_type,
@@ -506,10 +491,7 @@ class ReactLoop:
                         "query": query,
                     })
                     model_observation = result.observation
-                    if (
-                        result.success
-                        and not AGENT_CONFIG.get("llm_risk_level_review_enabled", False)
-                    ):
+                    if result.success:
                         model_observation = self._without_enterprise_risk_levels(
                             model_observation
                         )
@@ -524,31 +506,6 @@ class ReactLoop:
                         result.elapsed_ms,
                     )
                     result_evidence = recorder.evidence_for_call(call.call_id)
-                    enterprise_risk_evidence = self._enterprise_risk_evidence(
-                        result_evidence
-                    )
-                    high_risk_labels = {"high", "高", "高风险"}
-                    high_risk_evidence_ids = [
-                        evidence_id
-                        for evidence_id, risk_level in enterprise_risk_evidence.items()
-                        if risk_level.casefold() in high_risk_labels
-                    ]
-                    if (
-                        result.success
-                        and enterprise_risk_evidence
-                        and AGENT_CONFIG.get("llm_risk_level_review_enabled", False)
-                    ):
-                        risk_evidence_summary = ", ".join(
-                            f"{evidence_id}（{risk_level}）"
-                            for evidence_id, risk_level in enterprise_risk_evidence.items()
-                        )
-                        tool_content += (
-                            "\n\n程序审查路由提示：本次检索命中企业内部风险规则 "
-                            f"{risk_evidence_summary}。请将关联条款纳入对应风险等级的审查处置路径，"
-                            "核对规则适用性、合同事实和实际受影响方。规则适用时，其内部等级是统一风险等级的最低处置线；"
-                            "合同证据支持更高等级时保留更高等级。企业内部风险等级须在报告中原样单独记录，"
-                            "并作为内部控制要求说明，不得将其伪装成法律结论。"
-                        )
                     yield encode_event("tool_result", {
                         "task_id": task_label,
                         "tool": call.name,
@@ -570,9 +527,6 @@ class ReactLoop:
                             }
                             for evidence_id, item in result_evidence.items()
                         ],
-                        "risk_evidence_ids": list(enterprise_risk_evidence),
-                        "enterprise_risk_levels": enterprise_risk_evidence,
-                        "high_risk_evidence_ids": high_risk_evidence_ids,
                         "error": result.error,
                     })
                     messages.append({

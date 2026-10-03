@@ -882,19 +882,9 @@ def execute_stream_review(
                     f"{item.get('source_location', '来源位置未提供')} [{item.get('evidence_id')}]"
                     for item in sources
                 ) if sources else "；未命中知识库来源"
-                risk_ids = data.get("risk_evidence_ids", [])
-                risk_levels = data.get("enterprise_risk_levels", {})
-                risk_route_text = (
-                    "；触发企业风险等级处置路径："
-                    + ", ".join(
-                        f"{evidence_id}（{risk_levels.get(evidence_id, '等级未提供')}）"
-                        for evidence_id in risk_ids
-                    )
-                    if risk_ids else ""
-                )
                 append_flow(
                     f"工具结果：已注入模型工作记忆（带出 {data.get('injected_chars', 0)} 字符）"
-                    f"{source_text}{risk_route_text}"
+                    f"{source_text}"
                 )
             else:
                 append_flow(
@@ -996,19 +986,9 @@ def _worker_clause_review(
                 f"{item.get('source_location', '来源位置未提供')} [{item.get('evidence_id')}]"
                 for item in sources
             ) if sources else "；未命中知识库来源"
-            risk_ids = data.get("risk_evidence_ids", [])
-            risk_levels = data.get("enterprise_risk_levels", {})
-            risk_route_text = (
-                "；触发企业风险等级处置路径："
-                + ", ".join(
-                    f"{evidence_id}（{risk_levels.get(evidence_id, '等级未提供')}）"
-                    for evidence_id in risk_ids
-                )
-                if risk_ids else ""
-            )
             message = (
                 f"工具完成: {data.get('tool')}；带出 {data.get('injected_chars', 0)} 字符"
-                f"{source_text}{risk_route_text}"
+                f"{source_text}"
                 if data.get("success")
                 else f"工具失败并已回传模型: {data.get('error', '')}"
             )

@@ -693,14 +693,11 @@ class ReActLoopTests(unittest.TestCase):
             if event["event"] == "final_report"
         )
         self.assertEqual(requests, [])
-        format_stage = next(
-            json.loads(event["data"])
-            for event in events
-            if event["event"] == "pipeline_stage"
+        self.assertFalse(any(
+            event["event"] == "pipeline_stage"
             and json.loads(event["data"])["stage"] == "format_validation"
-            and json.loads(event["data"])["status"] == "skipped"
-        )
-        self.assertIn("直接采用大模型原始输出", format_stage["message"])
+            for event in events
+        ))
         self.assertEqual(final["status"], "success")
         self.assertEqual(final["raw_report"], report)
         self.assertEqual(requests, [])
@@ -800,13 +797,11 @@ class ReActLoopTests(unittest.TestCase):
         )
         self.assertFalse(any(event["event"] == "rule_assessment" for event in events))
         self.assertEqual(final["raw_report"], report)
-        reconciliation = next(
-            json.loads(event["data"])
-            for event in events
-            if event["event"] == "pipeline_stage"
+        self.assertFalse(any(
+            event["event"] == "pipeline_stage"
             and json.loads(event["data"])["stage"] == "report_reconciliation"
-        )
-        self.assertEqual(reconciliation["status"], "skipped")
+            for event in events
+        ))
         self.assertEqual(final["status"], "success")
         self.assertTrue(final["is_complete"])
         self.assertEqual(recorder.status, "success")
@@ -991,31 +986,7 @@ class ReActLoopTests(unittest.TestCase):
         )
         self.assertEqual(tool_result["injected_chars"], len(tool_message["content"]))
 
-    def test_enterprise_risk_evidence_handles_all_levels(self):
-        evidence = {
-            evidence_id: {
-                "source_type": "enterprise_rule",
-                "enterprise_risk_level": risk_level,
-            }
-            for evidence_id, risk_level in [
-                ("RULE_HIGH", "High"),
-                ("RULE_MEDIUM", "Medium"),
-                ("RULE_LOW", "Low"),
-                ("RULE_NOTICE", "Notice"),
-            ]
-        }
-
-        self.assertEqual(
-            ReactLoop._enterprise_risk_evidence(evidence),
-            {
-                "RULE_HIGH": "High",
-                "RULE_MEDIUM": "Medium",
-                "RULE_LOW": "Low",
-                "RULE_NOTICE": "Notice",
-            },
-        )
-
-    def test_authoritative_grade_is_pinned_when_model_risk_review_is_disabled(self):
+    def test_enterprise_evidence_guidance_pins_authoritative_grade(self):
         evidence = {
             "RULE7": {
                 "source_type": "enterprise_rule",
@@ -1025,11 +996,7 @@ class ReActLoopTests(unittest.TestCase):
             }
         }
 
-        with patch.dict(
-            app_config.AGENT_CONFIG,
-            {"llm_risk_level_review_enabled": False},
-        ):
-            guidance = ReactLoop._enterprise_evidence_guidance(evidence)
+        guidance = ReactLoop._enterprise_evidence_guidance(evidence)
 
         pinned_records = json.loads(guidance.split("\n", 1)[1])
         self.assertEqual(pinned_records[0]["enterprise_risk_level"], "High")
@@ -1090,9 +1057,9 @@ class ReActLoopTests(unittest.TestCase):
             if item["event"] == "tool_result"
         )
         self.assertEqual(tool_result["evidence_sources"][0]["evidence_id"], "RULE3")
-        self.assertEqual(tool_result["risk_evidence_ids"], ["RULE3"])
-        self.assertEqual(tool_result["enterprise_risk_levels"], {"RULE3": "High"})
-        self.assertEqual(tool_result["high_risk_evidence_ids"], ["RULE3"])
+        self.assertNotIn("risk_evidence_ids", tool_result)
+        self.assertNotIn("enterprise_risk_levels", tool_result)
+        self.assertNotIn("high_risk_evidence_ids", tool_result)
         self.assertNotIn("纳入对应风险等级的审查处置路径", requests[1]["messages"][-1]["content"])
         self.assertIn(
             '"enterprise_risk_level": "High"',
@@ -1103,8 +1070,6 @@ class ReActLoopTests(unittest.TestCase):
              if item["event"] == "pipeline_stage"],
             [
                 "tool_recording",
-                "format_validation",
-                "report_reconciliation",
                 "review_complete", "tool_recording",
             ],
         )

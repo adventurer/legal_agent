@@ -123,9 +123,6 @@ AGENT_CONFIG: Dict[str, Any] = {
     "report_format_repair_enabled": os.getenv(
         "REPORT_FORMAT_REPAIR_ENABLED", "false"
     ).strip().lower() in {"1", "true", "yes", "on"},
-    "llm_risk_level_review_enabled": os.getenv(
-        "LLM_RISK_LEVEL_REVIEW_ENABLED", "false"
-    ).strip().lower() in {"1", "true", "yes", "on"},
     "stop": ["Observation:"], # ReAct 工具调用截断符
     "max_turns": 6,           # 默认最大推理轮次
     "max_context_tokens": VLLM_CONFIG["max_model_len"],

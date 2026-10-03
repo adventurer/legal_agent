@@ -45,9 +45,6 @@ class ToolResultPayload(EventPayload):
     elapsed_ms: int
     injected_chars: int = 0
     evidence_sources: list[EvidenceSourcePayload] = Field(default_factory=list)
-    risk_evidence_ids: list[str] = Field(default_factory=list)
-    enterprise_risk_levels: Dict[str, str] = Field(default_factory=dict)
-    high_risk_evidence_ids: list[str] = Field(default_factory=list)
     error: Optional[str] = None
 
 

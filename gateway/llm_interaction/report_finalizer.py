@@ -419,20 +419,6 @@ class ReportFinalizer:
         call_count = len(tool_call_records.snapshot()["calls"])
         yield encode_event("pipeline_stage", {
             "task_id": task_id,
-            "stage": "format_validation",
-            "status": "skipped",
-            "message": "已关闭报告格式校验，直接采用大模型原始输出",
-            "count": 0,
-        })
-        yield encode_event("pipeline_stage", {
-            "task_id": task_id,
-            "stage": "report_reconciliation",
-            "status": "skipped",
-            "message": "已关闭企业规则核对，直接输出模型提交报告",
-            "count": call_count,
-        })
-        yield encode_event("pipeline_stage", {
-            "task_id": task_id,
             "stage": "review_complete",
             "status": "completed",
             "message": "已接收模型提交报告",
