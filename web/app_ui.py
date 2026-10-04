@@ -805,6 +805,7 @@ def execute_stream_review(
     review_side: str = "neutral",
 ) -> Optional[str]:
     st.session_state.is_reviewing = True
+    st.session_state.final_report = ""
     st.session_state.structured_report = None
     saved_flow = {
         "mode": "stream",
@@ -1259,10 +1260,10 @@ with nullcontext():
     # 渲染 Markdown 报告
     if st.session_state.final_report:
         evidence_records = st.session_state.evidence_records
-        if st.session_state.structured_report is None:
-            parsed_report = parse_structured_report(st.session_state.final_report)
-            if parsed_report:
-                st.session_state.structured_report = parsed_report.model_dump(mode="json")
+        parsed_report = parse_structured_report(st.session_state.final_report)
+        st.session_state.structured_report = (
+            parsed_report.model_dump(mode="json") if parsed_report else None
+        )
         structured_reviews = (st.session_state.structured_report or {}).get("reviews", [])
         report_model = (
             ContractReviewReport.model_validate(st.session_state.structured_report)
