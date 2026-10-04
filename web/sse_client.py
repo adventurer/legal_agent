@@ -11,7 +11,6 @@ def stream_contract_review(
     base_url: str,
     contract_text: str,
     max_turns: int,
-    review_run_id: str | None = None,
     review_side: str = "neutral",
     timeout: float = 180.0,
 ) -> Iterator[Dict[str, Any]]:
@@ -23,8 +22,6 @@ def stream_contract_review(
             "stream": True,
             "review_side": review_side,
         }
-        if review_run_id:
-            payload["review_run_id"] = review_run_id
         with connect_sse(
             client,
             "POST",

@@ -152,19 +152,5 @@ Final:
 
 EMPTY_SEARCH_RETRY_PROMPT = """本次工具检索未返回有效知识库依据。不得使用模型已有法律知识、预训练记忆、专业常识或经验继续推断，也不得编造规则、结论或证据编号。合同原文只可用于复述和核对合同事实；对需要外部规则或专业知识支持的法律、商业及履约判断，明确说明“未检索到知识库依据，无法据此判断”，并请求补充知识库资料或重新检索。不要用无依据的风险等级、法律结论或修改建议填充报告。"""
 
-CONTRACT_REWRITE_PROMPT = """你是合同修订专家。请根据审查报告，只修改下方指定的合同条款。
-不得修改未提供的条款，不得改变合同主体、金额、日期和其他未被审查意见要求修改的事实。
-必须保留原条款中的全部子条款及其编号/序号、顺序和正文内容；即使审查意见未涉及某个子条款，也不得删除、合并、概括或省略。只修改审查意见明确要求调整的内容。
-返回的 index 必须与指定条款对象中的 index 完全一致，即 {clause_index}。
-必须返回严格 JSON，不要输出 Markdown 或代码围栏：
-{{"revised_clauses":[{{"index":{clause_index},"revised_text":"修订后的完整条款正文","change_reason":"修改原因"}}]}}
-
-指定条款：
-{clauses}
-
-审查报告：
-{review_report}
-"""
-
 def format_observation(observation_content: str) -> str:
     return f"Observation: {observation_content}\nThought: "

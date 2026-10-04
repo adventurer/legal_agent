@@ -14,7 +14,6 @@ class EventPayload(BaseModel):
 
 class StartPayload(EventPayload):
     message: str
-    trace_id: Optional[str] = None
 
 
 class TokenPayload(EventPayload):

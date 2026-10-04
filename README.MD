@@ -36,19 +36,9 @@ pip install streamlit httpx-sse
 # 审查意见导出
 # Streamlit 支持下载 Markdown (.md) 和 Word (.docx) 两种格式
 
-# 合同修订
-# 审查完成后，在条款明细中勾选“纳入合同修订”，
-# 点击“根据选中条款和审查意见生成修订合同”即可生成新版合同。
-# 未选中的条款保持原文，并支持 Markdown / Word 导出。
+# 系统提供合同审查和审查意见导出，不提供自动生成或导出修订合同的功能。
 
-# API 调试
-# 启动 API 服务时增加 --debug，可在控制台打印每轮 messages、请求参数、模型响应和工具结果：
-python gateway/api_server.py --debug
-
-# 每次审查都会清空并重写 data/review_logs/review_trace.jsonl
-# 文件包含提交的合同文本、模型每轮输出、工具调用/返回、熔断事件及最终结果。
-# 多条款并发审查共享一个批次编号，只在批次首个请求开始时清空一次。
-# 记录可能包含合同敏感信息，请勿提交或外传；data/ 已由 .gitignore 排除。
+# 审查过程不持久化保存合同正文、模型输入输出或工具交互记录。
 
 # 4. 创建项目专属目录并进入
 mkdir -p ~/legal_agent_lab && cd ~/legal_agent_lab
@@ -76,7 +66,6 @@ streamlit run web/main.py --server.port 8501
 # services/doc_loader.py 仅负责多格式文档读取与文本归一化
 # services/clause_splitter.py 负责合同条款切分
 # services/document_models.py 定义文档领域模型
-# services/mock_contract_generator.py 负责生成解析测试素材
 # gateway/upload_service.py 负责上传校验与临时文件写入
 # web/api_client.py 负责 Streamlit 到 FastAPI 网关的 HTTP 调用
 # archive/ 保存已确认不再作为运行入口的历史副本

@@ -7,19 +7,11 @@ from typing import Any, AsyncGenerator, Dict
 
 from starlette.concurrency import iterate_in_threadpool
 
-from configs.config import AGENT_CONFIG
-from core.prompts import (
-    KNOWLEDGE_EVIDENCE_SUPPLEMENT_PROMPT,
-    REPORT_FORMAT_REPAIR_PROMPT,
-)
 from services.report_parser import (
-    normalize_report_structure,
     parse_structured_report,
     restore_clause_numbers,
-    validate_report_structure,
 )
 
-from .contracts import FinalReportArguments
 from .events import encode_event
 from .tool_call_recorder import ToolCallRecorder
 
@@ -271,10 +263,6 @@ class ReportFinalizer:
             normalized_reviews.setdefault(
                 ReportFinalizer._normalize_clause_topic(topic), []
             ).append(review)
-        missing_values = {
-            "", "初稿未提供", "未检索到企业内部风险等级",
-            "未检索到相关企业规则或知识库依据",
-        }
         supplements = {}
         for topic, suggestion in proposed.items():
             review = valid_reviews.get(topic)

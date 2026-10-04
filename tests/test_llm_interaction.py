@@ -11,7 +11,6 @@ from core.schemas import ReviewRequest
 from gateway.llm_interaction.context_manager import ContextWindowManager
 from gateway.llm_interaction.react_loop import _max_output_tokens
 from gateway.llm_interaction.contracts import ModelToolCall
-from gateway.llm_interaction.events import encode_event
 from gateway.llm_interaction.final_report import (
     FinalReportValidationError,
     validate_final_report,
@@ -33,7 +32,6 @@ from core.prompts import (
 )
 from core.schemas import ContractReviewReport
 from services.pdf_kb_search import search_pages
-from services.report_parser import parse_structured_report
 
 
 def _chunk(content=None, tool_calls=None, finish_reason=None, usage=None):
@@ -1013,10 +1011,6 @@ class ReActLoopTests(unittest.TestCase):
 - **风险剖析**: 验收期限未明确，付款条件可能长期无法触发。
 - **修改建议**: 明确验收期限和逾期未反馈的处理方式。
 """
-        repaired_report = report.replace(
-            "- **风险类型**: 初稿未提供",
-            "- **风险类型**: 商业",
-        )
         agent, requests = _agent(iter([]))
         recorder = ToolCallRecorder("placeholder-repair")
 

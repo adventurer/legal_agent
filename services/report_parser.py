@@ -2,7 +2,7 @@
 
 import json
 import re
-from typing import Any, Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple
 
 from core.schemas import ContractReviewReport
 from core.prompts import RISK_LEVEL_REPORT_LEGEND
@@ -288,7 +288,7 @@ def validate_report_structure(raw_text: str) -> list[str]:
         issues.append("缺少按合同原编号排列的条款标题")
         return issues
 
-    for position, (heading_index, heading) in enumerate(numbered_headings, start=1):
+    for position, (_, heading) in enumerate(numbered_headings, start=1):
         next_heading_index = (
             numbered_headings[position][0]
             if position < len(numbered_headings)

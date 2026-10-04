@@ -4,9 +4,8 @@
 文件名: gateway/session_manager.py
 职责:
 1. 多租户/多会话隔离 (基于 session_id)
-2. 维护对话历史上下文与审查中状态
-3. 实现滑动窗口机制，限制单会话最大历史轮次，防止超出模型 4096 Token 上限
-4. 定期淘汰超时过期会话，释放服务器内存
+2. 保存解析后的合同条款
+3. 定期淘汰超时过期会话，释放服务器内存
 """
 
 import time
@@ -19,11 +18,8 @@ from dataclasses import dataclass, field
 class ReviewSession:
     """单个审查会话状态实体"""
     session_id: str
-    created_at: float = field(default_factory=time.time)
     last_active: float = field(default_factory=time.time)
     contract_clauses: List[Dict[str, Any]] = field(default_factory=list)  # 切分后的合同条款
-    history_messages: List[Dict[str, str]] = field(default_factory=list)  # 对话历史
-    metadata: Dict[str, Any] = field(default_factory=dict)                # 扩展字段
 
     def touch(self):
         """刷新最近活跃时间戳"""
@@ -35,27 +31,19 @@ class SessionManager:
 
     def __init__(
         self,
-        max_history_turns: int = 5,
         session_timeout_seconds: int = 3600,
-        max_history_chars: int = 6000,
     ):
         """
-        :param max_history_turns: 滑动窗口保留的最大交互轮次（每轮包含 assistant 与 user）
         :param session_timeout_seconds: 会话过期淘汰时长（默认 1 小时）
         """
         self._sessions: Dict[str, ReviewSession] = {}
-        self.max_history_turns = max_history_turns
         self.session_timeout = session_timeout_seconds
-        self.max_history_chars = max(1, int(max_history_chars))
 
-    def create_session(self, metadata: Optional[Dict[str, Any]] = None) -> str:
+    def create_session(self) -> str:
         """创建一个全新的会话"""
         self.cleanup_expired_sessions()
         session_id = str(uuid.uuid4())
-        session = ReviewSession(
-            session_id=session_id,
-            metadata=metadata or {},
-        )
+        session = ReviewSession(session_id=session_id)
         self._sessions[session_id] = session
         return session_id
 
@@ -78,44 +66,6 @@ class SessionManager:
         session.contract_clauses = clauses
         return True
 
-    def append_message(self, session_id: str, role: str, content: str) -> bool:
-        """追加单条消息并执行滑动窗口裁剪"""
-        session = self.get_session(session_id)
-        if not session:
-            return False
-
-        session.history_messages.append({"role": role, "content": content})
-        self._apply_sliding_window(session)
-        return True
-
-    def get_context_messages(self, session_id: str, system_prompt: str) -> List[Dict[str, str]]:
-        """获取拼装好 system prompt 的完整上下文消息链条"""
-        session = self.get_session(session_id)
-        if not session:
-            return [{"role": "system", "content": system_prompt}]
-
-        return [{"role": "system", "content": system_prompt}] + session.history_messages
-
-    def _apply_sliding_window(self, session: ReviewSession):
-        """
-        同时限制历史消息条数和字符总量。字符预算只是 Token 上限的保守近似，
-        不能替代模型 tokenizer 的精确计数。
-        """
-        max_messages = self.max_history_turns * 2
-        if len(session.history_messages) > max_messages:
-            # 丢弃最早的多余轮次
-            session.history_messages = session.history_messages[-max_messages:]
-        while (
-            len(session.history_messages) > 1
-            and sum(len(message.get("content", "")) for message in session.history_messages)
-            > self.max_history_chars
-        ):
-            session.history_messages.pop(0)
-        if session.history_messages:
-            latest = session.history_messages[-1]
-            if len(latest.get("content", "")) > self.max_history_chars:
-                latest["content"] = latest["content"][-self.max_history_chars:]
-
     def delete_session(self, session_id: str):
         """显式销毁会话"""
         if session_id in self._sessions:
@@ -134,20 +84,3 @@ class SessionManager:
 
 # 全局单例管理器
 session_manager = SessionManager()
-
-
-if __name__ == "__main__":
-    print("[*] 正在测试 SessionManager...")
-    mgr = SessionManager(max_history_turns=2)
-    s_id = mgr.create_session()
-    print(f"[+] 创建会话成功: {s_id}")
-
-    # 模拟多轮对话并测试滑动窗口
-    for i in range(6):
-        mgr.append_message(s_id, "user", f"问题 {i}")
-        mgr.append_message(s_id, "assistant", f"回答 {i}")
-
-    session = mgr.get_session(s_id)
-    print(f"[+] 滑动窗口后保留消息数: {len(session.history_messages)} (预期 4 条)")
-    for msg in session.history_messages:
-        print(f"  - {msg['role']}: {msg['content']}")

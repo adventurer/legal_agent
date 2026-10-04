@@ -10,8 +10,8 @@
 """
 
 from enum import Enum
-from typing import List, Optional, Any, Dict, Literal
-from pydantic import BaseModel, Field, field_validator, model_validator
+from typing import List, Optional, Any, Literal
+from pydantic import BaseModel, Field, field_validator
 
 
 class RiskLevel(str, Enum):
@@ -151,37 +151,10 @@ class ReviewRequest(BaseModel):
         default=True,
         description="是否启用打字机流式输出"
     )
-    review_run_id: Optional[str] = Field(
-        default=None,
-        min_length=1,
-        max_length=80,
-        description="同一轮多条款审查共享的追踪批次 ID",
-    )
     review_side: Literal["buyer", "seller", "neutral"] = Field(
         default="neutral",
         description="审查立场：甲方、乙方或中立",
     )
-
-
-class ContractRevisionItem(BaseModel):
-    """用户确认后用于重写的单个合同条款。"""
-    index: int
-    title: str
-    original_text: str
-    suggested_revision: str
-
-
-class ContractRewriteRequest(BaseModel):
-    """按用户选择的条款生成修订版合同。"""
-    clauses: List[Dict[str, Any]] = Field(..., min_length=1)
-    review_report: str = Field(..., min_length=1)
-    selected_indices: List[int] = Field(default_factory=list)
-
-
-class ContractRewriteResponse(BaseModel):
-    """修订版合同及逐条修改结果。"""
-    contract_text: str
-    revised_clauses: List[Dict[str, Any]] = Field(default_factory=list)
 
 
 class AgentExecutionResult(BaseModel):

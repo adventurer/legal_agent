@@ -35,7 +35,6 @@ class ReviewExecutionTests(unittest.TestCase):
             "http://gateway",
             "合同正文",
             4,
-            "run-1",
             "buyer",
             on_event=lambda event, data: observed.append(event),
             stream_factory=lambda *args, **kwargs: iter(events),
@@ -43,8 +42,8 @@ class ReviewExecutionTests(unittest.TestCase):
 
         self.assertTrue(result["success"])
         self.assertEqual(result["report"], raw_report)
-        self.assertEqual(result["model_text"], "模型文本")
-        self.assertEqual(result["model_report"], raw_report)
+        self.assertNotIn("model_text", result)
+        self.assertNotIn("model_report", result)
         self.assertEqual(result["evidence_records"]["EV1"]["source_type"], "law")
         self.assertEqual(observed, [item["event"] for item in events])
 
@@ -58,7 +57,6 @@ class ReviewExecutionTests(unittest.TestCase):
                     "http://gateway",
                     "合同正文",
                     4,
-                    "run-1",
                     "neutral",
                     stream_factory=lambda *args, **kwargs: iter([{
                         "event": "final_report",
@@ -84,7 +82,6 @@ class ReviewExecutionTests(unittest.TestCase):
                     "http://gateway",
                     "合同正文",
                     4,
-                    "run-1",
                     "neutral",
                     stream_factory=lambda *args, **kwargs: iter(events),
                 )

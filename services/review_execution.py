@@ -32,14 +32,11 @@ def execute_review_unit(
     base_url: str,
     contract_text: str,
     max_turns: int,
-    review_run_id: str,
     review_side: str,
     on_event: Optional[ReviewEventHandler] = None,
     stream_factory: Callable[..., Iterable[Dict[str, Any]]] = stream_contract_review,
 ) -> Dict[str, Any]:
     """Consume one review stream and return its canonical result for either UI mode."""
-    model_text = ""
-    streamed_report = ""
     raw_report = ""
     final_complete = False
     evidence_records: Dict[str, Dict[str, Any]] = {}
@@ -50,7 +47,6 @@ def execute_review_unit(
             base_url,
             contract_text,
             max_turns,
-            review_run_id=review_run_id,
             review_side=review_side,
         )
         for item in events:
@@ -58,11 +54,7 @@ def execute_review_unit(
             data = item.get("data", {})
             if on_event:
                 on_event(event, data)
-            if event == "token":
-                model_text += data.get("token", "")
-            elif event == "report_token":
-                streamed_report += data.get("token", "")
-            elif event == "tool_result":
+            if event == "tool_result":
                 collect_evidence_observation(
                     data.get("observation", ""), evidence_records
                 )
@@ -93,8 +85,6 @@ def execute_review_unit(
     return {
         "success": success,
         "report": report,
-        "model_text": model_text,
-        "model_report": raw_report or streamed_report,
         "evidence_records": evidence_records,
         "error": error,
     }

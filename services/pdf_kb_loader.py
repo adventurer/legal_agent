@@ -297,7 +297,6 @@ def load_documents(docs_dir: Path) -> List[Dict[str, Any]]:
         )
     )
     print(f"[*] 正在从 {docs_dir} 加载参考文档，发现 {len(pdf_files)} 个 PDF 和 {len(text_files)} 个文本文件...")
-    pages: List[Dict[str, Any]] = []
     articles: List[Dict[str, Any]] = []
     for text_path in text_files:
         doc_name, tag = text_path.name, determine_tag(text_path.name)

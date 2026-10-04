@@ -11,7 +11,6 @@
 
 import os
 import sys
-import json
 import asyncio
 from collections import Counter
 from pathlib import Path
@@ -39,17 +38,12 @@ from configs.config import (
 )
 from core.schemas import (
     ReviewRequest,
-    AgentExecutionResult,
-    ContractRewriteRequest,
-    ContractRewriteResponse,
 )
 from core.agent_loop import ContractReviewAgent
 from services.doc_loader import DocumentLoader
 from gateway.session_manager import session_manager
 from gateway.upload_service import create_temp_upload_path, get_safe_extension, save_upload_file
 from gateway.review_orchestrator import ReviewOrchestrator
-from services.contract_rewriter import rewrite_selected_clauses
-from services.review_trace import ReviewTrace
 from gateway.model_runtime import model_runtime
 from services.pdf_kb_loader import (
     convert_law_source_to_txt,
@@ -544,79 +538,14 @@ async def review_contract_stream(request: ReviewRequest):
         request.contract_text.strip(),
     )
     task_label = clause_title_match.group(1).strip() if clause_title_match else f"Task-{uuid.uuid4().hex[:6]}"
-    review_run_id = request.review_run_id or uuid.uuid4().hex
-
-    try:
-        trace = ReviewTrace(
-            DATA_DIR / "review_logs",
-            contract_text=request.contract_text,
-            max_turns=limit_turns,
-            model=agent_instance.model_name,
-            task_label=task_label,
-            review_run_id=review_run_id,
-        )
-    except OSError as exc:
-        print(f"[警告] 无法创建审查调试记录: {exc}", flush=True)
-        trace = None
-
-    async def traced_stream():
-        trace_status = "interrupted"
-        try:
-            async for item in review_orchestrator.stream(
-                request.contract_text,
-                limit_turns,
-                task_label,
-                request.review_side,
-            ):
-                if item.get("event") == "start" and trace:
-                    try:
-                        payload = json.loads(item.get("data", "{}"))
-                        payload["trace_id"] = trace.trace_id
-                        item = {**item, "data": json.dumps(payload, ensure_ascii=False)}
-                    except (TypeError, ValueError):
-                        pass
-                if trace:
-                    trace.record_sse(item)
-                if item.get("event") == "final_report":
-                    try:
-                        result = json.loads(item.get("data", "{}"))
-                        trace_status = result.get("status", "completed") if result.get("is_complete") else "incomplete"
-                    except (TypeError, ValueError):
-                        trace_status = "incomplete"
-                elif item.get("event") == "error":
-                    trace_status = "error"
-                elif item.get("event") == "done" and trace_status == "interrupted":
-                    trace_status = "finished_without_final_report"
-                yield item
-        except Exception as exc:
-            trace_status = "error"
-            if trace:
-                trace.record_sse({
-                    "event": "gateway_exception",
-                    "data": json.dumps({"error": str(exc)}, ensure_ascii=False),
-                })
-            raise
-        finally:
-            if trace:
-                trace.close(trace_status)
-
     return EventSourceResponse(
-        traced_stream()
-    )
-
-
-@app.post("/api/v1/contract/rewrite", response_model=ContractRewriteResponse)
-async def rewrite_contract(request: ContractRewriteRequest):
-    try:
-        result = rewrite_selected_clauses(
-            agent_instance,
-            request.clauses,
-            request.review_report,
-            request.selected_indices,
+        review_orchestrator.stream(
+            request.contract_text,
+            limit_turns,
+            task_label,
+            request.review_side,
         )
-        return result
-    except (ValueError, KeyError, TypeError) as exc:
-        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    )
 
 
 def main():
