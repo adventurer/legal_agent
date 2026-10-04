@@ -6,6 +6,7 @@ from typing import Any, Dict, Optional, Tuple
 
 from core.schemas import ContractReviewReport
 from core.prompts import RISK_LEVEL_REPORT_LEGEND
+from services.clause_splitter import ClauseSplitter
 
 
 REPORT_SIGNATURES = (
@@ -90,6 +91,54 @@ def clean_report_content(raw_text: str) -> str:
         cleaned,
     )
     return cleaned.strip()
+
+
+def restore_clause_numbers(
+    report: ContractReviewReport, contract_text: str
+) -> ContractReviewReport:
+    """Restore omitted source numbering when a report title has one unique match."""
+    numbered_headings = []
+    heading_pattern = re.compile(
+        r"^(?P<number>第[一二三四五六七八九十百千万零〇两\d]+[条章]|"
+        r"\d+(?:\.\d+)*(?:[.、)]?)|[（(]\d+[）)]|"
+        r"[一二三四五六七八九十百]+、)\s*(?P<title>\S.*)$"
+    )
+
+    for clause in ClauseSplitter.split(contract_text):
+        if clause.clause_type != "article":
+            continue
+        source_headings = [clause.title, *clause.content.splitlines()]
+        for source_heading in source_headings:
+            match = heading_pattern.match(source_heading.strip())
+            if match:
+                source_title = re.split(
+                    r"[：:]", match.group("title"), maxsplit=1
+                )[0].strip()
+                numbered_headings.append(
+                    (match.group("number"), source_title)
+                )
+
+    def normalize_title(title: str) -> str:
+        return re.sub(r"[\s\W_]+", "", title, flags=re.UNICODE).casefold()
+
+    titles_by_key: Dict[str, list[str]] = {}
+    for number, title in numbered_headings:
+        key = normalize_title(title)
+        if key:
+            titles_by_key.setdefault(key, []).append(number)
+
+    for review in report.reviews:
+        topic = review.clause_topic.strip()
+        topic_heading = heading_pattern.match(topic)
+        title = topic_heading.group("title") if topic_heading else topic
+        matches = list(dict.fromkeys(
+            titles_by_key.get(normalize_title(title), [])
+        ))
+        if len(matches) == 1:
+            source_number = matches[0]
+            if not topic_heading or topic_heading.group("number") != source_number:
+                review.clause_topic = f"{source_number} {title}"
+    return report
 
 
 def validate_report_structure(raw_text: str) -> list[str]:

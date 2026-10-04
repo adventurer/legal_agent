@@ -6,11 +6,67 @@ from services.report_parser import (
     is_final_report,
     parse_structured_report,
     render_report_article,
+    restore_clause_numbers,
     validate_report_structure,
 )
 
 
 class ReportParserTests(unittest.TestCase):
+    def test_restores_missing_article_and_subclause_numbers_from_contract(self):
+        report = parse_structured_report(
+            '{"reviews":['
+            '{"clause_topic":"争议解决与仲裁","risk_level":"High",'
+            '"legal_basis":"无直接依据","issue":"争议机制失衡。",'
+            '"suggested_revision":"明确仲裁机构。"},'
+            '{"clause_topic":"友好协商","risk_level":"Low",'
+            '"legal_basis":"无直接依据","issue":"程序不清晰。",'
+            '"suggested_revision":"补充协商期限。"},'
+            '{"clause_topic":"仲裁管辖约定","risk_level":"High",'
+            '"legal_basis":"无直接依据","issue":"管辖约定不明确。",'
+            '"suggested_revision":"明确仲裁地点。"}'
+            ']}'
+        )
+        self.assertIsNotNone(report)
+        contract_text = (
+            "第八条 争议解决与仲裁\n"
+            "8.1 友好协商：双方先行协商。\n"
+            "8.2 仲裁管辖约定：双方提交仲裁。"
+        )
+
+        restored = restore_clause_numbers(report, contract_text)
+
+        self.assertEqual(
+            [item.clause_topic for item in restored.reviews],
+            [
+                "第八条 争议解决与仲裁",
+                "8.1 友好协商",
+                "8.2 仲裁管辖约定",
+            ],
+        )
+
+    def test_corrects_report_sequence_number_and_does_not_guess_ambiguous_title(self):
+        report = parse_structured_report(
+            '{"reviews":['
+            '{"clause_topic":"1. 付款安排","risk_level":"Low",'
+            '"legal_basis":"无直接依据","issue":"条款需明确。",'
+            '"suggested_revision":"明确付款期限。"},'
+            '{"clause_topic":"重复标题","risk_level":"Low",'
+            '"legal_basis":"无直接依据","issue":"条款需明确。",'
+            '"suggested_revision":"进一步明确。"}'
+            ']}'
+        )
+        self.assertIsNotNone(report)
+        contract_text = (
+            "第八条 付款安排\n约定付款期限。\n"
+            "第九条 重复标题\n约定甲方责任。\n"
+            "第十条 重复标题\n约定乙方责任。"
+        )
+
+        restored = restore_clause_numbers(report, contract_text)
+
+        self.assertEqual(restored.reviews[0].clause_topic, "第八条 付款安排")
+        self.assertEqual(restored.reviews[1].clause_topic, "重复标题")
+
     def test_renders_json_report_as_readable_markdown_article(self):
         report = parse_structured_report(
             '{"reviews":[{"clause_topic":"第五条 验收","risk_level":"High",'

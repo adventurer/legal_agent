@@ -20,5 +20,18 @@ def rewrite_contract(
         },
         timeout=180.0,
     )
-    response.raise_for_status()
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        try:
+            error_body = exc.response.json()
+        except (ValueError, AttributeError):
+            error_body = None
+        if isinstance(error_body, dict) and error_body.get("detail"):
+            raise httpx.HTTPStatusError(
+                f"{exc} - {error_body['detail']}",
+                request=exc.request,
+                response=exc.response,
+            ) from exc
+        raise
     return response.json()

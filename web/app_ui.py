@@ -70,7 +70,7 @@ st.markdown("""
     }
     .block-container {
         padding-top: 2rem !important;
-        padding-bottom: 3rem !important;
+        padding-bottom: 12rem !important;
         max-width: 98% !important;
     }
     .main-header {
@@ -86,13 +86,6 @@ st.markdown("""
         color: inherit;
         opacity: 0.72;
         margin-bottom: 0.8rem;
-    }
-    .top-control-panel {
-        background-color: #F8FAFC;
-        border: 1px solid #E2E8F0;
-        border-radius: 8px;
-        padding: 14px 18px 8px 18px;
-        margin-bottom: 1.2rem;
     }
     .circuit-break-card {
         background-color: #FFFBEB;
@@ -332,11 +325,7 @@ def render_saved_review_flow() -> None:
             flow.get("thought", ""),
             model_report,
         )
-        if flow.get("status") in {"审查完成", "审查失败"}:
-            with st.expander("模型交互记录", expanded=False):
-                st.markdown(rendered_output, unsafe_allow_html=True)
-        else:
-            st.markdown(rendered_output, unsafe_allow_html=True)
+        st.markdown(rendered_output, unsafe_allow_html=True)
         return
 
     for clause in flow.get("clauses", {}).values():
@@ -350,11 +339,7 @@ def render_saved_review_flow() -> None:
             clause.get("thought", ""),
             model_report,
         )
-        if clause.get("status") in {"审查完成", "审查失败"}:
-            with st.expander("模型交互记录", expanded=False):
-                st.markdown(rendered_output, unsafe_allow_html=True)
-        else:
-            st.markdown(rendered_output, unsafe_allow_html=True)
+        st.markdown(rendered_output, unsafe_allow_html=True)
 
 
 @st.dialog("条款内容")
@@ -400,6 +385,11 @@ def show_evidence_content(evidence: Dict[str, Any]) -> None:
         if not evidence.get("source_location"):
             st.caption(f"来源页码：{evidence.get('page_start', '?')}" + (f"–{evidence['page_end']}" if evidence.get("page_end") != evidence.get("page_start") else ""))
     st.text_area("命中条款原文（文本提取）", value=evidence.get("text", ""), height=420, disabled=True)
+
+
+@st.dialog("完整审查报告", width="large")
+def show_full_review_report(report: str) -> None:
+    st.markdown(report)
 
 
 def format_report_evidence_refs(
@@ -594,7 +584,6 @@ with st.expander("🛠️ 服务管理", expanded=health.get("status") != "healt
             st.warning("请先在网关服务页启动网关，待其运行后即可选择模型。")
 
 with nullcontext():
-    st.markdown('<div class="top-control-panel">', unsafe_allow_html=True)
     ctrl_col1, ctrl_col2, ctrl_col3, ctrl_col4, ctrl_col5 = st.columns(
         [1.5, 1.1, 0.9, 1.0, 0.9], gap="medium"
     )
@@ -645,9 +634,6 @@ with nullcontext():
             st.session_state.revised_contract_signature = None
             st.session_state.review_flow = None
             st.rerun()
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
 
 # ==================== 5. 中部工作区 ====================
 with nullcontext():
@@ -1210,8 +1196,14 @@ def execute_concurrent_clause_review(
 
 # ==================== 8. 下部：审查轨迹与展示 ====================
 with nullcontext():
-    st.markdown("#### 🔍 模型交互记录与风险审查报告")
-    render_saved_review_flow()
+    review_flow = st.session_state.get("review_flow")
+    if review_flow:
+        flow_status = review_flow.get("status", "审查中")
+        with st.expander(
+            f"🤖 模型交互记录 · {flow_status}",
+            expanded=st.session_state.is_reviewing,
+        ):
+            render_saved_review_flow()
 
     if selected_clause_idx is not None:
         target_clause = next((c for c in st.session_state.clauses if c.get("index") == selected_clause_idx), None)
@@ -1267,6 +1259,65 @@ with nullcontext():
     # 渲染 Markdown 报告
     if st.session_state.final_report:
         evidence_records = st.session_state.evidence_records
+        if st.session_state.structured_report is None:
+            parsed_report = parse_structured_report(st.session_state.final_report)
+            if parsed_report:
+                st.session_state.structured_report = parsed_report.model_dump(mode="json")
+        structured_reviews = (st.session_state.structured_report or {}).get("reviews", [])
+        report_model = (
+            ContractReviewReport.model_validate(st.session_state.structured_report)
+            if st.session_state.structured_report is not None
+            else None
+        )
+        export_source = (
+            render_report_article(report_model)
+            if report_model
+            else report_text_for_display(st.session_state.final_report)
+        )
+        readable_report = format_report_evidence_refs(
+            export_source,
+            evidence_records,
+        )
+        export_filename = f"contract_review_{int(time.time())}"
+
+        st.markdown("#### 🔍 风险审查报告")
+
+        with st.container(border=True):
+            summary_col, markdown_col, word_col, full_report_col = st.columns(
+                [2, 1, 1, 1]
+            )
+            with summary_col:
+                st.markdown("#### 审查结果")
+                summary = (
+                    f"共 {len(structured_reviews)} 条条款审查意见"
+                    if report_model
+                    else "报告暂无法解析为结构化条目"
+                )
+                st.caption(summary)
+            with markdown_col:
+                st.download_button(
+                    label="📥 导出 Markdown",
+                    data=readable_report,
+                    file_name=f"{export_filename}.md",
+                    mime="text/markdown",
+                    use_container_width=True,
+                )
+            with word_col:
+                try:
+                    docx_report = report_to_docx(readable_report)
+                    st.download_button(
+                        label="📄 导出 Word",
+                        data=docx_report,
+                        file_name=f"{export_filename}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                    )
+                except RuntimeError as exc:
+                    st.error(str(exc))
+            with full_report_col:
+                if st.button("查看完整报告", use_container_width=True):
+                    show_full_review_report(readable_report)
+
         if evidence_records:
             source_labels = {
                 "law": "法规",
@@ -1281,7 +1332,10 @@ with nullcontext():
             source_summary = "，".join(
                 f"{label} {count} 条" for label, count in source_counts.items() if count
             )
-            with st.expander(f"📚 本次检索依据（共 {len(evidence_records)} 条：{source_summary}）", expanded=True):
+            with st.expander(
+                f"📚 本次检索依据（共 {len(evidence_records)} 条：{source_summary}）",
+                expanded=False,
+            ):
                 for evidence_id, evidence in evidence_records.items():
                     citation = f"《{evidence.get('doc_name', '参考文档')}》"
                     if evidence.get("article_no"):
@@ -1298,15 +1352,9 @@ with nullcontext():
                         citation += f" · 内部等级 {evidence['enterprise_risk_level']}"
                     if st.button(f"查看原文：{citation}", key=f"all_evidence_{evidence_id}"):
                         show_evidence_content(evidence)
-        else:
-            st.info("本次审查没有收集到可展示的检索依据。")
-        if st.session_state.structured_report is None:
-            parsed_report = parse_structured_report(st.session_state.final_report)
-            if parsed_report:
-                st.session_state.structured_report = parsed_report.model_dump(mode="json")
-        structured_reviews = (st.session_state.structured_report or {}).get("reviews", [])
-        if st.session_state.structured_report is not None:
-            st.warning(
+
+        if report_model:
+            st.caption(
                 "按法律效力、商业后果、救济成本及所选审查立场综合分级；中风险及以上为审查红线；商务提示需要衡量履约能力。低风险区企业内部风险等级为高时需要重点关注！"
             )
             risk_levels = [
@@ -1334,76 +1382,69 @@ with nullcontext():
                     if not items:
                         st.info(f"当前报告没有{label}条款。")
                     for index, item in enumerate(items, 1):
-                        st.markdown(f"#### {index}. {item.get('clause_topic', '未命名条款')}")
-                        if item.get("risk_type"):
-                            st.markdown(f"**风险类型：** {item['risk_type']}")
-                        st.markdown(f"**风险等级：** {label}")
-                        if item.get("enterprise_risk_level"):
-                            st.markdown(f"**企业内部风险等级：** {item['enterprise_risk_level']}")
-                        if item.get("affected_party"):
-                            st.markdown(f"**受影响方：** {item['affected_party']}")
-                        if item.get("confidence"):
-                            st.markdown(f"**结论置信度：** {item['confidence']}")
-                        for field, label_text in (
-                            ("legal_effect", "法律效力"),
-                            ("commercial_impact", "商业后果"),
-                            ("remedy_cost", "救济成本"),
+                        clause_title = item.get("clause_topic", "未命名条款")
+                        with st.expander(
+                            f"{index}. {clause_title} · {label}",
+                            expanded=True,
                         ):
-                            if item.get(field):
-                                st.markdown(f"**{label_text}：** {item[field]}")
-                        legal_basis = item.get("legal_basis", "")
-                        evidence_ids = list(dict.fromkeys(re.findall(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", legal_basis)))
-                        legal_basis_for_display = legal_basis
-                        if not evidence_ids and evidence_records:
-                            article_refs = set(re.findall(r"第\s*[零〇一二三四五六七八九十百千万两0-9]+\s*条", legal_basis))
-                            for article_ref in article_refs:
-                                matching_refs = []
-                                for evidence_id, evidence in evidence_records.items():
-                                    if evidence.get("article_no") != article_ref:
-                                        continue
-                                    if re.fullmatch(r"EV[A-Za-z0-9]+", evidence_id):
-                                        matching_refs.append(f"[[EVIDENCE:{evidence_id}]]")
-                                    elif re.fullmatch(r"RULE\d+", evidence_id):
-                                        matching_refs.append(f"[[RULE:{evidence_id}]]")
-                                if matching_refs:
-                                    legal_basis_for_display = legal_basis_for_display.replace(
-                                        article_ref, "、".join(matching_refs), 1
-                                    )
-                        visible_basis = format_report_evidence_refs(
-                            legal_basis_for_display,
-                            st.session_state.evidence_records,
-                            inline_sources=True,
-                        ).strip()
-                        visible_basis = re.sub(r"^[\s、，,；;]+|[\s、，,；;]+$", "", visible_basis)
-                        if visible_basis:
-                            st.markdown(f"**法律/合规依据：** {visible_basis}", unsafe_allow_html=True)
-                        elif evidence_ids:
-                            st.markdown("**法律/合规依据：** 关联以下检索原文（请核对原文是否支持本项分析）")
-                        else:
-                            st.markdown("**法律/合规依据：** 未检索到直接依据")
-                        enterprise_basis = format_report_evidence_refs(
-                            item.get("enterprise_basis", ""),
-                            st.session_state.evidence_records,
-                            inline_sources=True,
-                        ).strip()
-                        if enterprise_basis:
-                            st.markdown(f"**企业知识库依据：** {enterprise_basis}", unsafe_allow_html=True)
-                        for evidence_id in evidence_ids:
-                            if evidence_id not in st.session_state.evidence_records:
-                                st.warning(f"报告引用的证据 {evidence_id} 未在本次检索记录中找到。")
-                        st.markdown(f"**风险分析：** {item.get('issue', '')}")
-                        st.markdown(f"**修改建议：** {item.get('suggested_revision', '')}")
-                        if index < len(items):
-                            st.divider()
-            with st.expander("查看完整审查报告"):
-                report_model = ContractReviewReport.model_validate(
-                    st.session_state.structured_report
-                )
-                report_article = format_report_evidence_refs(
-                    render_report_article(report_model),
-                    st.session_state.evidence_records,
-                )
-                st.markdown(report_article)
+                            if item.get("risk_type"):
+                                st.markdown(f"**风险类型：** {item['risk_type']}")
+                            st.markdown(f"**风险等级：** {label}")
+                            if item.get("enterprise_risk_level"):
+                                st.markdown(f"**企业内部风险等级：** {item['enterprise_risk_level']}")
+                            if item.get("affected_party"):
+                                st.markdown(f"**受影响方：** {item['affected_party']}")
+                            if item.get("confidence"):
+                                st.markdown(f"**结论置信度：** {item['confidence']}")
+                            for field, label_text in (
+                                ("legal_effect", "法律效力"),
+                                ("commercial_impact", "商业后果"),
+                                ("remedy_cost", "救济成本"),
+                            ):
+                                if item.get(field):
+                                    st.markdown(f"**{label_text}：** {item[field]}")
+                            legal_basis = item.get("legal_basis", "")
+                            evidence_ids = list(dict.fromkeys(re.findall(r"\[\[EVIDENCE:(EV[A-Za-z0-9]+)\]\]", legal_basis)))
+                            legal_basis_for_display = legal_basis
+                            if not evidence_ids and evidence_records:
+                                article_refs = set(re.findall(r"第\s*[零〇一二三四五六七八九十百千万两0-9]+\s*条", legal_basis))
+                                for article_ref in article_refs:
+                                    matching_refs = []
+                                    for evidence_id, evidence in evidence_records.items():
+                                        if evidence.get("article_no") != article_ref:
+                                            continue
+                                        if re.fullmatch(r"EV[A-Za-z0-9]+", evidence_id):
+                                            matching_refs.append(f"[[EVIDENCE:{evidence_id}]]")
+                                        elif re.fullmatch(r"RULE\d+", evidence_id):
+                                            matching_refs.append(f"[[RULE:{evidence_id}]]")
+                                    if matching_refs:
+                                        legal_basis_for_display = legal_basis_for_display.replace(
+                                            article_ref, "、".join(matching_refs), 1
+                                        )
+                            visible_basis = format_report_evidence_refs(
+                                legal_basis_for_display,
+                                evidence_records,
+                                inline_sources=True,
+                            ).strip()
+                            visible_basis = re.sub(r"^[\s、，,；;]+|[\s、，,；;]+$", "", visible_basis)
+                            if visible_basis:
+                                st.markdown(f"**法律/合规依据：** {visible_basis}", unsafe_allow_html=True)
+                            elif evidence_ids:
+                                st.markdown("**法律/合规依据：** 关联以下检索原文（请核对原文是否支持本项分析）")
+                            else:
+                                st.markdown("**法律/合规依据：** 未检索到直接依据")
+                            enterprise_basis = format_report_evidence_refs(
+                                item.get("enterprise_basis", ""),
+                                evidence_records,
+                                inline_sources=True,
+                            ).strip()
+                            if enterprise_basis:
+                                st.markdown(f"**企业知识库依据：** {enterprise_basis}", unsafe_allow_html=True)
+                            for evidence_id in evidence_ids:
+                                if evidence_id not in evidence_records:
+                                    st.warning(f"报告引用的证据 {evidence_id} 未在本次检索记录中找到。")
+                            st.markdown(f"**风险分析：** {item.get('issue', '')}")
+                            st.markdown(f"**修改建议：** {item.get('suggested_revision', '')}")
         else:
             st.warning("报告未能解析成风险条目，以下显示完整原始报告。")
             st.code(
@@ -1411,39 +1452,5 @@ with nullcontext():
                 language="markdown",
                 wrap_lines=True,
             )
-
-        st.markdown("<br>", unsafe_allow_html=True)
-        export_col1, export_col2 = st.columns(2)
-        export_filename = f"contract_review_{int(time.time())}"
-        if st.session_state.structured_report:
-            export_source = render_report_article(
-                ContractReviewReport.model_validate(st.session_state.structured_report)
-            )
-        else:
-            export_source = report_text_for_display(st.session_state.final_report)
-        readable_report = format_report_evidence_refs(
-            export_source,
-            st.session_state.evidence_records,
-        )
-        with export_col1:
-            st.download_button(
-                label="📥 导出 Markdown 报告",
-                data=readable_report,
-                file_name=f"{export_filename}.md",
-                mime="text/markdown",
-                use_container_width=True,
-            )
-        with export_col2:
-            try:
-                docx_report = report_to_docx(readable_report)
-                st.download_button(
-                    label="📄 导出 Word 报告",
-                    data=docx_report,
-                    file_name=f"{export_filename}.docx",
-                    mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    use_container_width=True,
-                )
-            except RuntimeError as exc:
-                st.error(str(exc))
     elif not st.session_state.is_reviewing:
         st.info("💡 操作指引：确认待审合同后，点击【开始执行合同智能合规审查】或展开条款明细点击【单独审查】。")

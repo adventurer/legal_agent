@@ -36,7 +36,7 @@ REPORT_STRUCTURE_GUIDANCE = """【JSON 报告结构】
 最终报告必须是符合 submit_final_report 工具 schema 的 JSON 对象，顶层仅包含 reviews 数组；每个合同条款或子条款对应 reviews 中一个对象。不得输出 Markdown 标题、字段标签、代码围栏或 JSON 以外的文字。
 
 每个 review 对象须包含以下字段：
-- clause_topic：复用合同原编号和条款名称，不得使用占位标题或按风险维度拆分条目。
+- clause_topic：必须逐字保留合同原文中的条款编号和对应名称（包括“第X条”及“X.Y”等子条款编号）；不得省略、改写编号，不得使用占位标题或按风险维度拆分条目。
 - risk_level：只能是 "High"、"Medium"、"Low"、"Notice" 之一，分别对应高风险、中风险、低风险、履约/商务提示。
 - risk_type：法律合规、履约、商业、表述或履约/商务提示。
 - enterprise_risk_level：命中企业规则时填写知识库原始等级；未命中填写“未检索到企业内部风险等级”。
@@ -154,8 +154,10 @@ EMPTY_SEARCH_RETRY_PROMPT = """本次工具检索未返回有效知识库依据�
 
 CONTRACT_REWRITE_PROMPT = """你是合同修订专家。请根据审查报告，只修改下方指定的合同条款。
 不得修改未提供的条款，不得改变合同主体、金额、日期和其他未被审查意见要求修改的事实。
+必须保留原条款中的全部子条款及其编号/序号、顺序和正文内容；即使审查意见未涉及某个子条款，也不得删除、合并、概括或省略。只修改审查意见明确要求调整的内容。
+返回的 index 必须与指定条款对象中的 index 完全一致，即 {clause_index}。
 必须返回严格 JSON，不要输出 Markdown 或代码围栏：
-{{"revised_clauses":[{{"index":1,"revised_text":"修订后的完整条款正文","change_reason":"修改原因"}}]}}
+{{"revised_clauses":[{{"index":{clause_index},"revised_text":"修订后的完整条款正文","change_reason":"修改原因"}}]}}
 
 指定条款：
 {clauses}

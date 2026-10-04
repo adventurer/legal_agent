@@ -15,6 +15,7 @@ from core.prompts import (
 from services.report_parser import (
     normalize_report_structure,
     parse_structured_report,
+    restore_clause_numbers,
     validate_report_structure,
 )
 
@@ -412,6 +413,19 @@ class ReportFinalizer:
         finish_reason: str | None,
         tool_call_records: ToolCallRecorder,
     ) -> AsyncGenerator[Dict[str, str], None]:
+        parsed_report = parse_structured_report(report)
+        if parsed_report:
+            original_topics = [
+                item.clause_topic for item in parsed_report.reviews
+            ]
+            restored_report = restore_clause_numbers(
+                parsed_report, contract_text
+            )
+            restored_topics = [
+                item.clause_topic for item in restored_report.reviews
+            ]
+            if restored_topics != original_topics:
+                report = restored_report.model_dump_json(ensure_ascii=False)
         report = self._enforce_enterprise_risk_levels(
             report,
             tool_call_records.evidence_records(),

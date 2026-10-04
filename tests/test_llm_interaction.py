@@ -749,6 +749,37 @@ class ReActLoopTests(unittest.TestCase):
         )
         self.assertEqual(final_report["reviews"][0]["risk_level"], "Medium")
 
+    def test_finalizer_restores_omitted_contract_clause_number(self):
+        report = _canonical_report_json(
+            _valid_report_payload(clause_topic="付款条件")
+        )
+        agent, requests = _agent(iter([]))
+        recorder = ToolCallRecorder("restore-clause-number")
+
+        async def collect():
+            return [event async for event in ReportFinalizer(agent).finalize(
+                report=report,
+                contract_text="第二条 付款条件\n验收合格后 30 个工作日付款。",
+                task_id="review",
+                turn=1,
+                acknowledged_guardrails=[],
+                finish_reason="stop",
+                tool_call_records=recorder,
+            )]
+
+        events = asyncio.run(collect())
+        final = json.loads(next(
+            event["data"]
+            for event in events
+            if event["event"] == "final_report"
+        ))
+
+        self.assertEqual(
+            json.loads(final["raw_report"])["reviews"][0]["clause_topic"],
+            "第二条 付款条件",
+        )
+        self.assertEqual(requests, [])
+
     def test_finalizer_passes_through_report_without_rule_reconciliation(self):
         report = f"""{RISK_LEVEL_REPORT_LEGEND}
 

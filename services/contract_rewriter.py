@@ -7,6 +7,14 @@ from typing import Any, Dict, List
 from core.prompts import CONTRACT_REWRITE_PROMPT
 
 
+_SUBCLAUSE_MARKER_PATTERN = re.compile(
+    r"^\s*(?P<marker>(?:\d+(?:\.\d+)*[、.．)]?|[（(]\d+[）)]|"
+    r"[（(][一二三四五六七八九十百千万]+[）)]|"
+    r"[一二三四五六七八九十百千万]+[、.．）)]))\s*(?=\S)",
+    re.MULTILINE,
+)
+
+
 def _normalize_clause_title(value: Any) -> str:
     """Normalize Markdown formatting and spacing before comparing titles."""
     text = str(value or "")
@@ -14,6 +22,21 @@ def _normalize_clause_title(value: Any) -> str:
     text = re.sub(r"\[\]\([^)]+\)", "", text)
     text = re.sub(r"[*_`#]", "", text)
     return re.sub(r"\s+", "", text).strip().lower()
+
+
+def _subclause_markers(text: str) -> List[str]:
+    return [
+        re.sub(r"\s+", "", match.group("marker"))
+        for match in _SUBCLAUSE_MARKER_PATTERN.finditer(text)
+    ]
+
+
+def _preserves_subclause_markers(original_text: str, revised_text: str) -> bool:
+    actual_markers = iter(_subclause_markers(revised_text))
+    return all(
+        any(actual == expected for actual in actual_markers)
+        for expected in _subclause_markers(original_text)
+    )
 
 
 def _extract_json(raw_text: str) -> Dict[str, Any]:
@@ -83,37 +106,61 @@ def _rewrite_clause(
     prompt = CONTRACT_REWRITE_PROMPT.format(
         clauses=json.dumps([clause], ensure_ascii=False),
         review_report=clause_review,
+        clause_index=index,
     )
-    response = agent.client.chat.completions.create(
-        model=agent.model_name,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.0,
-        max_tokens=2048,
-        stream=False,
-    )
-    result = _extract_json(response.choices[0].message.content)
-    revised = None
+    original_text = str(clause.get("content", ""))
+    original_markers = _subclause_markers(original_text)
     normalized_title = _normalize_clause_title(title)
-    for item in result["revised_clauses"]:
-        if not item.get("revised_text"):
+    retry_instruction = ""
+
+    for attempt in range(2):
+        response = agent.client.chat.completions.create(
+            model=agent.model_name,
+            messages=[{"role": "user", "content": prompt + retry_instruction}],
+            temperature=0.0,
+            max_tokens=2048,
+            stream=False,
+        )
+        result = _extract_json(response.choices[0].message.content)
+        revised = None
+        for item in result["revised_clauses"]:
+            if not isinstance(item, dict) or not item.get("revised_text"):
+                continue
+            try:
+                item_index = int(item.get("index", -1))
+            except (TypeError, ValueError):
+                item_index = -1
+            item_title = _normalize_clause_title(item.get("title", ""))
+            # An explicit index is authoritative. A title match is only a fallback
+            # for responses that omit the index; never let a title override it.
+            if (item_index == index) or (
+                item_index < 0
+                and item_title
+                and item_title == normalized_title
+            ):
+                revised = item
+                break
+        if revised is None:
+            raise ValueError(f"模型未返回条款 {index} 的有效修订结果")
+
+        revised_text = str(revised["revised_text"])
+        if _preserves_subclause_markers(original_text, revised_text):
+            return revised
+        revised_markers = _subclause_markers(revised_text)
+        if not attempt:
+            retry_instruction = (
+                "\n\n上一次修订遗漏或重排了子条款编号。"
+                f"原文编号顺序：{'、'.join(original_markers)}；"
+                f"上次输出编号顺序：{'、'.join(revised_markers)}。"
+                "请重新输出完整条款，保留所有子条款编号、顺序及正文内容。"
+            )
             continue
-        try:
-            item_index = int(item.get("index", -1))
-        except (TypeError, ValueError):
-            item_index = -1
-        item_title = _normalize_clause_title(item.get("title", ""))
-        # An explicit index is authoritative. A title match is only a fallback
-        # for responses that omit the index; never let a title override it.
-        if (item_index == index) or (
-            item_index < 0
-            and item_title
-            and item_title == normalized_title
-        ):
-            revised = item
-            break
-    if revised is None:
-        raise ValueError(f"模型未返回条款 {index} 的有效修订结果")
-    return revised
+        raise ValueError(
+            f"模型两次修订均遗漏或重排了条款 {index} 的子条款；"
+            f"原文编号：{'、'.join(original_markers)}；"
+            f"最后输出编号：{'、'.join(revised_markers)}"
+        )
+    raise ValueError(f"模型未能完成条款 {index} 的修订")
 
 
 def rewrite_selected_clauses(
