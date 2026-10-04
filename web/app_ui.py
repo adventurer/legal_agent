@@ -1182,16 +1182,23 @@ def execute_concurrent_clause_review(
     st.session_state.review_flow["status"] = overall_status
     results.sort(key=lambda x: x["index"])
     aggregated_reviews = []
+    aggregation_error = False
     for result in results:
         if not result["success"]:
             continue
         parsed_report = parse_structured_report(result["report"])
-        if parsed_report:
+        if parsed_report and parsed_report.reviews:
             aggregated_reviews.extend(
                 item.model_dump(mode="json") for item in parsed_report.reviews
             )
+        else:
+            aggregation_error = True
 
     st.session_state.is_reviewing = False
+    if success_count != len(results) or aggregation_error:
+        st.session_state.review_flow["status"] = "并发审查不完整，未生成汇总报告"
+        return ""
+
     return json.dumps({"reviews": aggregated_reviews}, ensure_ascii=False)
 
 
@@ -1249,13 +1256,19 @@ with nullcontext():
                 }]
 
             st.session_state.final_report = ""
-            st.session_state.final_report = execute_concurrent_clause_review(
+            report = execute_concurrent_clause_review(
                 article_clauses,
                 max_workers=concurrency,
                 review_run_id=review_run_id,
                 review_side=review_side,
             )
-            st.rerun()
+            if report:
+                st.session_state.final_report = report
+                st.rerun()
+            else:
+                st.error(
+                    "并发审查未能生成完整报告；请查看模型交互记录中的失败条款并重试。"
+                )
 
     # 渲染 Markdown 报告
     if st.session_state.final_report:

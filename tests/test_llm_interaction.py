@@ -267,6 +267,103 @@ class ToolContractTests(unittest.TestCase):
         with self.assertRaises(FinalReportValidationError):
             validate_final_report(call, ["unlimited_liability"])
 
+    def test_final_report_rejects_missing_subclause_reviews(self):
+        contract_text = (
+            "第八条 争议解决\n"
+            "8.1 友好协商：双方先行协商。\n"
+            "8.2 仲裁管辖：协商不成时提交仲裁。"
+        )
+        call = ModelToolCall(
+            call_id="final",
+            name="submit_final_report",
+            arguments=_final_report_arguments(
+                _valid_report_payload(
+                    clause_topic="第八条 争议解决 8.1 友好协商"
+                )
+            ),
+        )
+
+        with self.assertRaisesRegex(
+            FinalReportValidationError,
+            "8.2 仲裁管辖",
+        ):
+            validate_final_report(call, [], contract_text=contract_text)
+
+    def test_final_report_rejects_empty_reviews_for_numbered_contract(self):
+        contract_text = "第九条 附则\n9.1 生效：签署后生效。"
+        call = ModelToolCall(
+            call_id="final",
+            name="submit_final_report",
+            arguments=json.dumps({
+                "report": {"reviews": []},
+                "acknowledged_guardrails": [],
+            }),
+        )
+
+        with self.assertRaisesRegex(
+            FinalReportValidationError,
+            "9.1 生效",
+        ):
+            validate_final_report(call, [], contract_text=contract_text)
+
+    def test_final_report_accepts_complete_subclause_coverage(self):
+        contract_text = (
+            "第八条 争议解决\n"
+            "8.1 友好协商：双方先行协商。\n"
+            "8.2 仲裁管辖：协商不成时提交仲裁。"
+        )
+        review = _valid_report_payload()["reviews"][0]
+        payload = {
+            "reviews": [
+                {**review, "clause_topic": "8.1 友好协商"},
+                {**review, "clause_topic": "8.2 仲裁管辖"},
+            ]
+        }
+        call = ModelToolCall(
+            call_id="final",
+            name="submit_final_report",
+            arguments=_final_report_arguments(payload),
+        )
+
+        submission = validate_final_report(
+            call,
+            [],
+            contract_text=contract_text,
+        )
+
+        self.assertEqual(len(submission.report.reviews), 2)
+
+    def test_final_report_does_not_require_nested_payment_list_as_separate_reviews(self):
+        contract_text = (
+            "第二条 验收与付款\n"
+            "2.1 验收流程：设备安装完成后验收。\n"
+            "2.2 货款分期结算：\n"
+            "（1）首付款：合同签订后支付。\n"
+            "（2）发货款：设备发货前支付。\n"
+            "（3）到货安装款：设备到货安装后支付。\n"
+            "（4）最终验收尾款：最终验收后支付。"
+        )
+        review = _valid_report_payload()["reviews"][0]
+        payload = {
+            "reviews": [
+                {**review, "clause_topic": "2.1 验收流程"},
+                {**review, "clause_topic": "2.2 货款分期结算"},
+            ]
+        }
+        call = ModelToolCall(
+            call_id="final",
+            name="submit_final_report",
+            arguments=_final_report_arguments(payload),
+        )
+
+        submission = validate_final_report(
+            call,
+            [],
+            contract_text=contract_text,
+        )
+
+        self.assertEqual(len(submission.report.reviews), 2)
+
     def test_missing_guardrail_field_defaults_only_when_none_are_required(self):
         report_payload = _valid_report_payload()
         nested_report = {

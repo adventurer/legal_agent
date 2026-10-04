@@ -3,7 +3,7 @@
 import json
 from typing import Any, Callable, Dict, Iterable, Optional
 
-from services.report_parser import clean_report_content, normalize_report_structure
+from services.report_parser import parse_structured_report
 from web.sse_client import stream_contract_review
 
 
@@ -80,10 +80,12 @@ def execute_review_unit(
     except Exception as exc:
         error = str(exc)
 
-    report = (
-        normalize_report_structure(raw_report)
-        or clean_report_content(raw_report)
-    ) if raw_report and final_complete else ""
+    report = raw_report if raw_report and final_complete else ""
+    if report:
+        parsed_report = parse_structured_report(report)
+        if not parsed_report or not parsed_report.reviews:
+            report = ""
+            error = "模型最终报告没有可用的结构化审查条目"
     success = bool(report) and not error
     if not success and not error:
         error = "最终报告为空"

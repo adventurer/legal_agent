@@ -54,6 +54,15 @@ NUMBERED_HEADING_PATTERN = (
     r"^(?:\d+(?:\.\d+)*(?:[.、)]?)(?:\s|$)"
     r"|第[一二三四五六七八九十百千万零〇两\d]+条(?:\s|$))"
 )
+SOURCE_REVIEW_HEADING_PATTERN = re.compile(
+    r"^\s*(?P<number>(?:\d+(?:\.\d+)*(?:[.、．)]?)|[（(]\d+[）)]|"
+    r"[（(][一二三四五六七八九十百千万]+[）)]|"
+    r"[一二三四五六七八九十百千万]+[、.．）)]))\s*(?P<title>\S.*)$"
+)
+SOURCE_ARTICLE_HEADING_PATTERN = re.compile(
+    r"^\s*(?P<number>第[一二三四五六七八九十百千万零〇两\d]+条)"
+    r"\s*(?P<title>\S.*)$"
+)
 
 
 def is_final_report(text: str) -> bool:
@@ -139,6 +148,117 @@ def restore_clause_numbers(
             if not topic_heading or topic_heading.group("number") != source_number:
                 review.clause_topic = f"{source_number} {title}"
     return report
+
+
+def missing_review_topics(
+    report: ContractReviewReport, contract_text: str
+) -> list[str]:
+    """Return source headings not represented by distinct final review items."""
+    expected = []
+    for clause in ClauseSplitter.split(contract_text):
+        if clause.clause_type != "article":
+            continue
+
+        child_headings = []
+        for line in clause.content.splitlines():
+            match = SOURCE_REVIEW_HEADING_PATTERN.match(line.strip())
+            if match:
+                title = re.split(r"[：:]", match.group("title"), maxsplit=1)[0].strip()
+                child_headings.append((match.group("number"), title))
+        if child_headings:
+            decimal_headings = [
+                item for item in child_headings
+                if re.fullmatch(
+                    r"\d+(?:\.\d+)+[.、．)]?",
+                    item[0],
+                )
+            ]
+            if decimal_headings:
+                min_depth = min(item[0].rstrip(".、．)").count(".") for item in decimal_headings)
+                expected.extend(
+                    item for item in decimal_headings
+                    if item[0].rstrip(".、．)").count(".") == min_depth
+                )
+                continue
+
+            simple_arabic_headings = [
+                item for item in child_headings
+                if re.fullmatch(r"\d+[、.．)]?", item[0])
+            ]
+            if simple_arabic_headings:
+                expected.extend(simple_arabic_headings)
+                continue
+
+            chinese_headings = [
+                item for item in child_headings
+                if re.fullmatch(
+                    r"(?:[一二三四五六七八九十百千万]+[、.．）)]|"
+                    r"[（(][一二三四五六七八九十百千万]+[）)])",
+                    item[0],
+                )
+            ]
+            if chinese_headings:
+                expected.extend(chinese_headings)
+                continue
+
+            expected.extend(
+                item for item in child_headings
+                if re.fullmatch(r"[（(]\d+[）)]", item[0])
+            )
+            continue
+
+        article_heading = SOURCE_ARTICLE_HEADING_PATTERN.match(clause.title.strip())
+        if article_heading:
+            expected.append((
+                article_heading.group("number"),
+                article_heading.group("title").strip(),
+            ))
+
+    if not expected:
+        return [] if report.reviews or not contract_text.strip() else ["合同正文"]
+
+    title_counts: Dict[str, int] = {}
+    for _, title in expected:
+        normalized = re.sub(r"[\s\W_]+", "", title, flags=re.UNICODE).casefold()
+        if normalized:
+            title_counts[normalized] = title_counts.get(normalized, 0) + 1
+
+    used_review_indices = set()
+    missing = []
+    for number, title in expected:
+        normalized_title = re.sub(
+            r"[\s\W_]+", "", title, flags=re.UNICODE
+        ).casefold()
+        matching_index = next(
+            (
+                index
+                for index, review in enumerate(report.reviews)
+                if index not in used_review_indices
+                and (
+                    re.search(
+                        rf"(?<![\w.]){re.escape(number)}(?![\w.])",
+                        review.clause_topic,
+                    )
+                    or (
+                        normalized_title
+                        and title_counts.get(normalized_title) == 1
+                        and normalized_title
+                        in re.sub(
+                            r"[\s\W_]+",
+                            "",
+                            review.clause_topic,
+                            flags=re.UNICODE,
+                        ).casefold()
+                    )
+                )
+            ),
+            None,
+        )
+        if matching_index is None:
+            missing.append(f"{number} {title}".strip())
+        else:
+            used_review_indices.add(matching_index)
+    return missing
 
 
 def validate_report_structure(raw_text: str) -> list[str]:

@@ -41,7 +41,7 @@ REPORT_STRUCTURE_GUIDANCE = """【JSON 报告结构】
 - risk_type：法律合规、履约、商业、表述或履约/商务提示。
 - enterprise_risk_level：命中企业规则时填写知识库原始等级；未命中填写“未检索到企业内部风险等级”。
 - legal_effect：有直接依据的判断；无依据时说明未检索到直接依据。
-- commercial_impact：具体影响及实际受影响方。
+- commercial_impact：原条款具体影响及实际受影响方。
 - remedy_cost：救济成本等级和理由。
 - affected_party：甲方、乙方或双方。
 - confidence：结论置信度，高、中或低。

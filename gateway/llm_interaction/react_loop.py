@@ -413,6 +413,7 @@ class ReactLoop:
                                 call,
                                 guardrail_codes,
                                 decoder.finish_reason,
+                                contract_text,
                             )
                         except FinalReportValidationError as exc:
                             force_final_report = True
@@ -424,6 +425,7 @@ class ReactLoop:
                                 "instruction": (
                                     "只重新提交 submit_final_report。acknowledged_guardrails 只能包含本次程序规则代码，"
                                     "不得填写工具名、证据编号或法规编号；没有程序规则代码时传空数组。"
+                                    "如果错误指出遗漏条款，必须补齐对应审查项；没有实质风险时如实说明，不得虚构风险。"
                                 ),
                             }, ensure_ascii=False)
                             result = ToolExecutionResult(
