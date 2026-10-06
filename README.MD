@@ -53,6 +53,8 @@ curl -i http://127.0.0.1:8000/v1/models
 # useage:
 python server/vllm_launcher.py --model qwen2.5-7b-awq --no-fp8-kv
 python server/vllm_launcher.py --model qwen2.5-3b --no-fp8-kv
+# Qwen3.5-4B uses an AWQ INT4 text-only checkpoint, Qwen3 tool parsers, and a 12K context; first launch downloads it.
+python server/vllm_launcher.py --model qwen3.5-4b --no-fp8-kv
 python gateway/api_server.py
 streamlit run web/main.py --server.port 8501
 

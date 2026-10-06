@@ -88,3 +88,31 @@ def execute_review_unit(
         "evidence_records": evidence_records,
         "error": error,
     }
+
+
+def aggregate_review_results(
+    results: Iterable[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Keep valid reports while returning failures for separate UI reporting."""
+    reviews = []
+    failures = []
+    for result in results:
+        title = result.get("title") or f"条款 {result.get('index', '')}".strip()
+        if not result.get("success"):
+            failures.append(f"{title}：{result.get('error') or '审查失败'}")
+            continue
+
+        parsed_report = parse_structured_report(result.get("report", ""))
+        if not parsed_report or not parsed_report.reviews:
+            failures.append(f"{title}：成功任务的报告无法解析为结构化条目")
+            continue
+        reviews.extend(
+            item.model_dump(mode="json") for item in parsed_report.reviews
+        )
+
+    report = (
+        json.dumps({"reviews": reviews}, ensure_ascii=False)
+        if reviews
+        else ""
+    )
+    return {"report": report, "failures": failures}

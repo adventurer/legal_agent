@@ -34,11 +34,26 @@ from core.schemas import ContractReviewReport
 from services.pdf_kb_search import search_pages
 
 
-def _chunk(content=None, tool_calls=None, finish_reason=None, usage=None):
+def _chunk(
+    content=None,
+    tool_calls=None,
+    finish_reason=None,
+    usage=None,
+    reasoning=None,
+):
     choices = []
-    if content is not None or tool_calls is not None or finish_reason is not None:
+    if (
+        content is not None
+        or tool_calls is not None
+        or finish_reason is not None
+        or reasoning is not None
+    ):
         choices.append(SimpleNamespace(
-            delta=SimpleNamespace(content=content, tool_calls=tool_calls),
+            delta=SimpleNamespace(
+                content=content,
+                tool_calls=tool_calls,
+                reasoning=reasoning,
+            ),
             finish_reason=finish_reason,
         ))
     return SimpleNamespace(choices=choices, usage=usage)
@@ -1276,6 +1291,52 @@ class ReActLoopTests(unittest.TestCase):
         self.assertIn("RULE3", final_evidence_prompt)
         self.assertIn("[[RULE:RULE3]]", final_evidence_prompt)
         self.assertIn("禁止由对方单方指定独任仲裁员", final_evidence_prompt)
+
+    def test_retries_reasoning_only_response_and_completes_report(self):
+        tool_names = [
+            "search_civil_code",
+            "get_company_policy",
+            "get_past_review_rules",
+            "search_general_materials",
+        ]
+        responses = iter([
+            [_chunk(tool_calls=[_tool_call_delta(
+                f"call_{name}", name, json.dumps({"query": f"查询 {name}"})
+            )], finish_reason="tool_calls")]
+            for name in tool_names
+        ] + [
+            [_chunk(reasoning="模型仍在推理，但没有生成文本或工具调用。",
+                    finish_reason="length")],
+            [_chunk(tool_calls=[_tool_call_delta(
+                "call_final",
+                "submit_final_report",
+                _final_report_arguments(),
+            )], finish_reason="tool_calls")],
+        ])
+        mapping = {
+            name: (lambda query: json.dumps({"evidence": []}))
+            for name in tool_names
+        }
+        agent, requests = _agent(responses, mapping)
+
+        async def collect():
+            return [item async for item in ReactLoop(agent).stream(
+                "合同正文", 5, "reasoning-only-retry"
+            )]
+
+        events = asyncio.run(collect())
+        final_event = next(
+            event for event in events if event["event"] == "final_report"
+        )
+        final = json.loads(final_event["data"])
+        self.assertTrue(final["is_complete"])
+        self.assertEqual(len(requests), 6)
+        self.assertEqual(requests[-1]["tool_choice"], "required")
+        self.assertEqual(
+            [tool["function"]["name"] for tool in requests[-1]["tools"]],
+            ["submit_final_report"],
+        )
+        self.assertFalse(any(event["event"] == "error" for event in events))
 
     def test_rejects_final_report_until_each_read_tool_has_been_called(self):
         tool_names = [

@@ -53,10 +53,16 @@ MODEL_PRESETS: Dict[str, Dict[str, Any]] = {
         "modelscope_id": "Qwen/Qwen2.5-7B-Instruct-AWQ", "max_model_len": 12000,
         "gpu_utilization": 0.75, "quantization": "awq",
     },
-    "qwen2.5-14b-awq": {
-        "served_name": "qwen2.5-14b", "model_dir_name": "Qwen2.5-14B-Instruct-AWQ",
-        "modelscope_id": "Qwen/Qwen2.5-14B-Instruct-AWQ", "max_model_len": 8192,
-        "gpu_utilization": 0.88, "quantization": "awq",
+    "qwen3.5-4b": {
+        "served_name": "qwen3.5-4b",
+        "model_dir_name": "Qwen3.5-4B-AWQ",
+        "modelscope_id": "QuantTrio/Qwen3.5-4B-AWQ",
+        "max_model_len": 12000,
+        "gpu_utilization": 0.75,
+        "quantization": "awq",
+        "language_model_only": True,
+        "tool_call_parser": "qwen3_coder",
+        "reasoning_parser": "qwen3",
     },
     "deepseek-r1-7b-awq": {
         "served_name": "deepseek-r1-7b", "model_dir_name": "DeepSeek-R1-Distill-Qwen-7B-AWQ",

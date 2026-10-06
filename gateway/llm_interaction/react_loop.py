@@ -540,9 +540,31 @@ class ReactLoop:
                 continue
 
             if not content:
+                if final_report_retries < FINAL_REPORT_RETRY_LIMIT:
+                    final_report_retries += 1
+                    if missing_tools:
+                        retry_instruction = (
+                            "上一轮没有返回有效工具调用。请立即调用必需工具 "
+                            f"{missing_tools[0]}，不要只输出分析。"
+                        )
+                    else:
+                        force_final_report = True
+                        retry_instruction = (
+                            "上一轮没有返回有效工具调用或最终文本。请立即单独调用 "
+                            "submit_final_report 提交最终报告，不要只输出分析。"
+                        )
+                    messages.extend([
+                        {"role": "assistant", "content": ""},
+                        {"role": "user", "content": retry_instruction},
+                    ])
+                    continue
+                finish_reason = (
+                    f"（finish_reason={decoder.finish_reason}）"
+                    if decoder.finish_reason else ""
+                )
                 yield encode_event("error", {
                     "task_id": task_label,
-                    "error": "模型未返回文本或有效工具调用。",
+                    "error": f"模型未返回文本或有效工具调用{finish_reason}。",
                 })
                 return
             final_report_text = clean_report_content(content)

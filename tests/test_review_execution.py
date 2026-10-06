@@ -1,10 +1,59 @@
 import json
 import unittest
 
-from services.review_execution import execute_review_unit
+from services.review_execution import (
+    aggregate_review_results,
+    execute_review_unit,
+)
 
 
 class ReviewExecutionTests(unittest.TestCase):
+    def test_aggregation_keeps_successful_reports_when_other_units_fail(self):
+        successful_report = json.dumps({
+            "reviews": [{
+                "clause_topic": "第一条 交付",
+                "legal_basis": "未检索到直接依据",
+                "issue": "交付期限不明确。",
+                "suggested_revision": "约定具体交付日期。",
+            }],
+        }, ensure_ascii=False)
+
+        result = aggregate_review_results([
+            {
+                "success": True,
+                "report": successful_report,
+                "title": "第一条 交付",
+                "index": 1,
+            },
+            {
+                "success": False,
+                "report": "",
+                "error": "网关超时",
+                "title": "第二条 验收",
+                "index": 2,
+            },
+        ])
+
+        self.assertTrue(result["report"])
+        parsed = json.loads(result["report"])
+        self.assertEqual(len(parsed["reviews"]), 1)
+        self.assertEqual(parsed["reviews"][0]["clause_topic"], "第一条 交付")
+        self.assertEqual(result["failures"], ["第二条 验收：网关超时"])
+
+    def test_aggregation_reports_all_failures_without_fabricating_report(self):
+        result = aggregate_review_results([
+            {
+                "success": False,
+                "report": "",
+                "error": "连接失败",
+                "title": "第一条 交付",
+                "index": 1,
+            },
+        ])
+
+        self.assertEqual(result["report"], "")
+        self.assertEqual(result["failures"], ["第一条 交付：连接失败"])
+
     def test_success_collects_one_canonical_result_for_any_caller(self):
         raw_report = json.dumps({
             "reviews": [{

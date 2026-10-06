@@ -37,6 +37,7 @@ from services.report_parser import (
     render_report_article,
 )
 from services.review_execution import (
+    aggregate_review_results,
     execute_review_unit,
 )
 from web.api_client import check_gateway_health as fetch_gateway_health
@@ -122,6 +123,8 @@ if "full_contract_text" not in st.session_state:
     st.session_state.full_contract_text = ""
 if "final_report" not in st.session_state:
     st.session_state.final_report = ""
+if "review_failures" not in st.session_state:
+    st.session_state.review_failures = []
 if "structured_report" not in st.session_state:
     st.session_state.structured_report = None
 if "evidence_records" not in st.session_state:
@@ -594,6 +597,7 @@ def execute_stream_review(
 ) -> Optional[str]:
     st.session_state.is_reviewing = True
     st.session_state.final_report = ""
+    st.session_state.review_failures = []
     st.session_state.structured_report = None
 
     with nullcontext():
@@ -682,6 +686,7 @@ def execute_concurrent_clause_review(
     st.session_state.is_reviewing = True
     st.session_state.structured_report = None
     st.session_state.evidence_records = {}
+    st.session_state.review_failures = []
     total_count = len(clauses_to_review)
 
     st.markdown(f"##### ⚡ 正在启用 {max_workers} 路线程并发审查 (共 {total_count} 个条款)...")
@@ -720,7 +725,7 @@ def execute_concurrent_clause_review(
                 max_turns,
                 review_side,
                 event_queue,
-            ): c["index"]
+            ): c
             for c in clauses_to_review
         }
         pending = set(future_map)
@@ -732,8 +737,19 @@ def execute_concurrent_clause_review(
                 return_when=FIRST_COMPLETED,
             )
             for future in completed:
-                c_idx = future_map[future]
-                res = future.result()
+                clause = future_map[future]
+                c_idx = clause["index"]
+                try:
+                    res = future.result()
+                except Exception as exc:
+                    res = {
+                        "success": False,
+                        "report": "",
+                        "evidence_records": {},
+                        "error": f"线程任务异常：{exc}",
+                        "index": c_idx,
+                        "title": clause.get("title", ""),
+                    }
                 results.append(res)
                 completed_count += 1
 
@@ -750,26 +766,11 @@ def execute_concurrent_clause_review(
         render_queued_events()
 
     progress_bar.empty()
-    success_count = sum(result["success"] for result in results)
     results.sort(key=lambda x: x["index"])
-    aggregated_reviews = []
-    aggregation_error = False
-    for result in results:
-        if not result["success"]:
-            continue
-        parsed_report = parse_structured_report(result["report"])
-        if parsed_report and parsed_report.reviews:
-            aggregated_reviews.extend(
-                item.model_dump(mode="json") for item in parsed_report.reviews
-            )
-        else:
-            aggregation_error = True
-
+    aggregation = aggregate_review_results(results)
+    st.session_state.review_failures = aggregation["failures"]
     st.session_state.is_reviewing = False
-    if success_count != len(results) or aggregation_error:
-        return ""
-
-    return json.dumps({"reviews": aggregated_reviews}, ensure_ascii=False)
+    return aggregation["report"]
 
 
 # ==================== 8. 下部：审查结果展示 ====================
@@ -824,8 +825,10 @@ with nullcontext():
                 st.session_state.final_report = report
                 st.rerun()
             else:
+                failure_details = "；".join(st.session_state.review_failures)
                 st.error(
-                    "并发审查未能生成完整报告，请检查上方失败条款状态并重试。"
+                    "并发审查未能生成可用报告。"
+                    + (f" 失败任务：{failure_details}" if failure_details else "")
                 )
 
     # 渲染 Markdown 报告
@@ -851,6 +854,12 @@ with nullcontext():
             evidence_records,
         )
         export_filename = f"contract_review_{int(time.time())}"
+
+        if st.session_state.review_failures:
+            st.warning(
+                "部分任务失败，以下仅汇总成功任务的审查报告；失败任务："
+                + "；".join(st.session_state.review_failures)
+            )
 
         st.markdown("#### 🔍 风险审查报告")
 

@@ -120,11 +120,17 @@ def launch_vllm_server(
         "--enforce-eager",
         "--enable-auto-tool-choice",
         "--tool-call-parser",
-        "hermes",
+        cfg.get("tool_call_parser", "hermes"),
     ]
 
     if cfg.get("quantization"):
         cmd.extend(["--quantization", cfg["quantization"]])
+
+    if cfg.get("language_model_only"):
+        cmd.append("--language-model-only")
+
+    if cfg.get("reasoning_parser"):
+        cmd.extend(["--reasoning-parser", cfg["reasoning_parser"]])
 
     if enable_fp8_kv:
         cmd.extend(["--kv-cache-dtype", "fp8"])
