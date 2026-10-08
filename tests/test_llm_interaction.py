@@ -7,12 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from configs import config as app_config
-from core.schemas import ReviewRequest
+from core.schemas import ReviewItem, ReviewRequest
 from gateway.llm_interaction.context_manager import ContextWindowManager
 from gateway.llm_interaction.react_loop import _max_output_tokens
 from gateway.llm_interaction.contracts import ModelToolCall
 from gateway.llm_interaction.final_report import (
     FinalReportValidationError,
+    recover_final_report,
     validate_final_report,
 )
 from gateway.llm_interaction.guardrails import detect_contract_flags
@@ -118,6 +119,15 @@ def _agent(responses, tool_mapping=None):
 
 
 class ToolContractTests(unittest.TestCase):
+    def test_review_schema_requires_nonempty_suggested_revision(self):
+        schema = ReviewItem.model_json_schema()
+
+        self.assertIn("suggested_revision", schema["required"])
+        self.assertEqual(
+            schema["properties"]["suggested_revision"]["minLength"],
+            1,
+        )
+
     def test_review_request_accepts_ui_max_turns_and_rejects_above_it(self):
         contract = "这是用于验证最大探索步数的合同正文样例，长度超过十个字符。"
 
@@ -279,6 +289,110 @@ class ToolContractTests(unittest.TestCase):
         )
         with self.assertRaises(FinalReportValidationError):
             validate_final_report(call, ["unlimited_liability"])
+
+    def test_final_report_decodes_json_string_report_field(self):
+        payload = json.loads(_final_report_arguments())
+        payload["report"] = json.dumps(payload["report"], ensure_ascii=False)
+        call = ModelToolCall(
+            call_id="stringified-report",
+            name="submit_final_report",
+            arguments=json.dumps(payload, ensure_ascii=False),
+        )
+
+        submission = validate_final_report(call, [])
+
+        self.assertEqual(len(submission.report.reviews), 1)
+
+    def test_final_report_decodes_string_report_with_one_extra_closing_brace(self):
+        payload = json.loads(_final_report_arguments())
+        payload["report"] = (
+            json.dumps(payload["report"], ensure_ascii=False) + "}"
+        )
+        call = ModelToolCall(
+            call_id="stringified-report-extra-brace",
+            name="submit_final_report",
+            arguments=json.dumps(payload, ensure_ascii=False),
+        )
+
+        submission = validate_final_report(call, [])
+
+        self.assertEqual(len(submission.report.reviews), 1)
+
+    def test_final_report_rejects_unrecoverable_json_string_report(self):
+        payload = json.loads(_final_report_arguments())
+        payload["report"] = '{"reviews": ['
+        call = ModelToolCall(
+            call_id="malformed-stringified-report",
+            name="submit_final_report",
+            arguments=json.dumps(payload, ensure_ascii=False),
+        )
+
+        with self.assertRaises(FinalReportValidationError) as context:
+            validate_final_report(call, [])
+
+        self.assertEqual(
+            context.exception.reason_code,
+            "report_string_unrecoverable",
+        )
+        self.assertEqual(context.exception.issue_types, ("json_invalid",))
+
+    def test_final_report_rejects_string_report_with_multiple_extra_braces(self):
+        payload = json.loads(_final_report_arguments())
+        payload["report"] = (
+            json.dumps(payload["report"], ensure_ascii=False) + "}}"
+        )
+        call = ModelToolCall(
+            call_id="stringified-report-multiple-extra-braces",
+            name="submit_final_report",
+            arguments=json.dumps(payload, ensure_ascii=False),
+        )
+
+        with self.assertRaises(FinalReportValidationError) as context:
+            validate_final_report(call, [])
+
+        self.assertEqual(
+            context.exception.reason_code,
+            "report_string_unrecoverable",
+        )
+
+    def test_final_report_fallback_recovers_extra_array_closer(self):
+        payload = json.loads(_final_report_arguments())
+        payload["report"] = (
+            json.dumps(payload["report"], ensure_ascii=False) + "]"
+        )
+        call = ModelToolCall(
+            call_id="stringified-report-extra-array-closer",
+            name="submit_final_report",
+            arguments=json.dumps(payload, ensure_ascii=False),
+        )
+
+        fallback = recover_final_report(call, [])
+
+        self.assertIsNotNone(fallback)
+        submission, normalized_fields, dropped_reviews = fallback
+        self.assertEqual(len(submission.report.reviews), 1)
+        self.assertEqual(normalized_fields, 0)
+        self.assertEqual(dropped_reviews, 0)
+
+    def test_final_report_fallback_fills_missing_required_display_fields(self):
+        report = _valid_report_payload()
+        del report["reviews"][0]["suggested_revision"]
+        call = ModelToolCall(
+            call_id="incomplete-report",
+            name="submit_final_report",
+            arguments=_final_report_arguments(report),
+        )
+
+        fallback = recover_final_report(call, ["required_guardrail"])
+
+        self.assertIsNotNone(fallback)
+        submission, normalized_fields, _ = fallback
+        self.assertEqual(
+            submission.report.reviews[0].suggested_revision,
+            "未提供修改建议",
+        )
+        self.assertEqual(submission.acknowledged_guardrails, [])
+        self.assertEqual(normalized_fields, 1)
 
     def test_final_report_rejects_missing_subclause_reviews(self):
         contract_text = (
@@ -563,6 +677,8 @@ class PromptAlignmentTests(unittest.TestCase):
         self.assertIn("[[EVIDENCE:EV编号]]", system_prompt)
         self.assertIn("submit_final_report", system_prompt)
         self.assertIn("不得填写工具名", system_prompt)
+        self.assertIn("acknowledged_guardrails 两个同级字段", system_prompt)
+        self.assertIn("尤其不得遗漏 suggested_revision", system_prompt)
         self.assertNotIn("工具轮只输出 Thought 和一行 Action", system_prompt)
         self.assertNotIn("最终轮以 Thought 和 Final: 开始", system_prompt)
 
@@ -1324,7 +1440,14 @@ class ReActLoopTests(unittest.TestCase):
                 "合同正文", 5, "reasoning-only-retry"
             )]
 
-        events = asyncio.run(collect())
+        with self.assertLogs("uvicorn.error", level="INFO") as captured_logs:
+            events = asyncio.run(collect())
+
+        log_output = "\n".join(captured_logs.output)
+        self.assertIn("react_started", log_output)
+        self.assertIn("react_model_request_completed", log_output)
+        self.assertIn("reasoning_chars=", log_output)
+        self.assertNotIn("模型仍在推理", log_output)
         final_event = next(
             event for event in events if event["event"] == "final_report"
         )
@@ -1412,25 +1535,17 @@ class ReActLoopTests(unittest.TestCase):
         self.assertEqual(requests[1]["messages"][-1]["role"], "tool")
         self.assertEqual(requests[1]["messages"][-1]["tool_call_id"], "bad_final")
 
-    def test_invalid_guardrail_names_get_a_bounded_final_report_retry(self):
-        responses = iter([
-            [_chunk(tool_calls=[_tool_call_delta(
+    def test_invalid_guardrail_names_use_fallback_without_acknowledging_them(self):
+        responses = iter([[
+            _chunk(tool_calls=[_tool_call_delta(
                 "bad_guardrails",
                 "submit_final_report",
                 json.dumps({
                     "report": _valid_report_payload(),
                     "acknowledged_guardrails": ["get_company_policy", "search_civil_code"],
                 }),
-            )], finish_reason="tool_calls")],
-            [_chunk(tool_calls=[_tool_call_delta(
-                "corrected_final",
-                "submit_final_report",
-                json.dumps({
-                    "report": _valid_report_payload(),
-                    "acknowledged_guardrails": [],
-                }),
-            )], finish_reason="tool_calls")],
-        ])
+            )], finish_reason="tool_calls")
+        ]])
         agent, requests = _agent(responses)
 
         async def collect():
@@ -1438,28 +1553,29 @@ class ReActLoopTests(unittest.TestCase):
                 "合同正文", 1, "guardrail-retry"
             )]
 
-        events = asyncio.run(collect())
+        with self.assertLogs("uvicorn.error", level="WARNING") as captured_logs:
+            events = asyncio.run(collect())
         payloads = [json.loads(item["data"]) for item in events]
         final = next(
             item for item in payloads
             if item.get("status") == "success"
         )
         self.assertTrue(final["is_complete"])
-        self.assertEqual(final["turns"], 2)
-        self.assertEqual(requests[1]["tool_choice"], "required")
-        self.assertEqual(
-            [tool["function"]["name"] for tool in requests[1]["tools"]],
-            ["submit_final_report"],
-        )
-        feedback = requests[1]["messages"][-1]["content"]
-        self.assertIn("不得填写工具名", feedback)
+        self.assertEqual(final["turns"], 1)
+        self.assertEqual(final["acknowledged_guardrails"], [])
+        self.assertEqual(len(requests), 1)
+        self.assertTrue(any(
+            "react_final_report_fallback" in line
+            and "reason=guardrail_acknowledgment_mismatch" in line
+            for line in captured_logs.output
+        ))
 
     def test_final_report_correction_retries_are_bounded(self):
         responses = iter([
             [_chunk(tool_calls=[_tool_call_delta(
                 f"invalid_final_{attempt}",
                 "submit_final_report",
-                '{"report":" ","acknowledged_guardrails":[]}',
+                '{"report":{"reviews":"invalid"},"acknowledged_guardrails":[]}',
             )], finish_reason="tool_calls")]
             for attempt in range(3)
         ])
@@ -1470,7 +1586,23 @@ class ReActLoopTests(unittest.TestCase):
                 "合同正文", 1, "bounded-final-retries"
             )]
 
-        events = asyncio.run(collect())
+        with self.assertLogs("uvicorn.error", level="WARNING") as captured_logs:
+            events = asyncio.run(collect())
+
+        rejection_logs = [
+            line for line in captured_logs.output
+            if "react_final_report_rejected" in line
+        ]
+        self.assertEqual(len(rejection_logs), 3)
+        self.assertTrue(all("reason=schema_validation" in line for line in rejection_logs))
+        self.assertTrue(all("issue_types=" in line for line in rejection_logs))
+        self.assertTrue(all(
+            json.dumps(
+                '{"report":{"reviews":"invalid"},"acknowledged_guardrails":[]}'
+            )
+            in line
+            for line in rejection_logs
+        ))
         final = next(
             json.loads(item["data"])
             for item in events
@@ -1480,6 +1612,62 @@ class ReActLoopTests(unittest.TestCase):
         self.assertFalse(final["is_complete"])
         self.assertEqual(final["status"], "incomplete")
         self.assertEqual(final["turns"], 3)
+
+    def test_rejected_report_with_recoverable_object_uses_fallback_without_retry(self):
+        tool_names = [
+            "search_civil_code",
+            "get_company_policy",
+            "get_past_review_rules",
+            "search_general_materials",
+        ]
+        responses = iter([
+            [_chunk(tool_calls=[_tool_call_delta(
+                f"call_{name}", name, json.dumps({"query": f"查询 {name}"})
+            )], finish_reason="tool_calls")]
+            for name in tool_names
+        ] + [[
+            _chunk(tool_calls=[_tool_call_delta(
+                "partial_final",
+                "submit_final_report",
+                _final_report_arguments(),
+            )], finish_reason="tool_calls")
+        ]])
+        mapping = {
+            name: (lambda query: json.dumps({"evidence": []}))
+            for name in tool_names
+        }
+        agent, requests = _agent(responses, mapping)
+        contract_text = (
+            "第八条 争议解决\n"
+            "8.1 友好协商：双方先行协商。\n"
+            "8.2 仲裁管辖：协商不成时提交仲裁。"
+        )
+
+        async def collect():
+            return [item async for item in ReactLoop(agent).stream(
+                contract_text, 5, "recover-final-report"
+            )]
+
+        with self.assertLogs("uvicorn.error", level="WARNING") as captured_logs:
+            events = asyncio.run(collect())
+
+        self.assertTrue(any(
+            "react_final_report_rejected" in line
+            and "reason=missing_review_topics" in line
+            for line in captured_logs.output
+        ), captured_logs.output)
+        self.assertTrue(any(
+            "react_final_report_fallback" in line
+            and "reason=missing_review_topics" in line
+            for line in captured_logs.output
+        ))
+        payloads = [json.loads(item["data"]) for item in events]
+        final = next(
+            payload for item, payload in zip(events, payloads)
+            if item["event"] == "final_report"
+        )
+        self.assertTrue(final["is_complete"])
+        self.assertEqual(len(requests), 5)
 
     def test_truncated_structured_final_is_returned_as_tool_error_for_retry(self):
         responses = iter([

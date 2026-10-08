@@ -60,7 +60,9 @@ def build_tool_schemas(
         "function": {
             "name": FINAL_REPORT_TOOL_NAME,
             "description": (
-                "提交最终合同审查报告。report 是顶层的 JSON 对象；acknowledged_guardrails 是与 report 同级的顶层数组，不能放进 report 内；"
+                "提交最终合同审查报告。report 是 JSON 对象，内部只包含 reviews；"
+                "每条 review 都必须包含非空 suggested_revision，无需改约时也要明确说明；"
+                "acknowledged_guardrails 是与 report 同级的顶层数组，不能放进 report 内；"
                 "acknowledged_guardrails 只能包含程序规则代码，不得填写工具名、证据编号或法规编号；"
                 f"{guardrail_instruction}"
             ),

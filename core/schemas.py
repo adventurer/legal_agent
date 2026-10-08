@@ -77,7 +77,8 @@ class ReviewItem(BaseModel):
     )
     suggested_revision: str = Field(
         ..., 
-        description="针对该条款的具体修改或补充建议"
+        min_length=1,
+        description="必填非空字符串。针对该条款给出具体修改或补充建议；无需改约时明确说明无需修改及相应业务执行建议，不得省略或留空"
     )
 
     @field_validator("clause_topic", "legal_basis", "issue", "suggested_revision", mode="before")

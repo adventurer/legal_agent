@@ -33,7 +33,7 @@ RISK_LEVEL_REPORT_LEGEND = """### 风险等级提示
 - **履约/商务提示**：条款义务清楚、未发现需要修改合同的缺陷，但一方须做好较高要求的执行准备。风险类型写“履约/商务提示”，风险等级写 "Notice"；报告中的具体执行义务、影响及业务确认事项按上方 Notice 专属规则填写，不得只给空泛提醒或留空。"""
 
 REPORT_STRUCTURE_GUIDANCE = """【JSON 报告结构】
-最终报告必须是符合 submit_final_report 工具 schema 的 JSON 对象，顶层仅包含 reviews 数组；每个合同条款或子条款对应 reviews 中一个对象。不得输出 Markdown 标题、字段标签、代码围栏或 JSON 以外的文字。
+调用 submit_final_report 时，工具参数最外层是对象，包含 report 和 acknowledged_guardrails 两个同级字段；没有程序规则代码时，acknowledged_guardrails 可省略或传空数组。report 本身是 JSON 对象，且只包含 reviews 数组。每个合同条款或子条款对应 reviews 中一个对象。不得把 report 序列化成字符串，不得输出 Markdown 标题、代码围栏或 JSON 以外的文字。
 
 每个 review 对象须包含以下字段：
 - clause_topic：必须逐字保留合同原文中的条款编号和对应名称（包括“第X条”及“X.Y”等子条款编号）；不得省略、改写编号，不得使用占位标题或按风险维度拆分条目。
@@ -48,9 +48,12 @@ REPORT_STRUCTURE_GUIDANCE = """【JSON 报告结构】
 - legal_basis：相关法条和实际证据编号；无直接依据时明确说明。
 - enterprise_basis：企业规则/知识库来源、位置和实际 [[RULE:RULE编号]] / [[KB:EV编号]]；无相关资料时填写“未检索到相关企业规则或知识库依据”。
 - issue：具体风险机制和影响。
-- suggested_revision：针对原条款的修改建议；无需修改时明确说明。
+- suggested_revision：必填、非空字符串，针对原条款给出具体修改或补充建议；无需改约时也必须明确写出“无需修改”及相应业务执行建议，不得省略、传 null 或传空字符串。
 
-schema 中的所有字段都必须保留；无可用值的可选字段使用 null。保留原编号、事实、期限、金额和证据引用，不得编造。风险等级图例仅作为定级依据，不要复制成报告正文。"""
+【提交前强制核对】
+在调用工具前逐个检查 reviews 中的每个对象：clause_topic、legal_basis、issue、suggested_revision 必须全部存在且为非空字符串，尤其不得遗漏 suggested_revision；其余 schema 字段也必须保留，无可用值的可选字段使用 null。先补齐所有条目再一次性提交，不要提交省略字段的部分报告。
+
+保留原编号、事实、期限、金额和证据引用，不得编造。风险等级图例仅作为定级依据，不要复制成报告正文。"""
 
 REVIEW_ANALYSIS_GUIDANCE = f"""【审查要求】
 - 资料边界：合同原文只用于确认合同事实；法律法规、行业标准、企业要求及其他外部事实，只能依据本轮工具实际返回且直接相关的知识库资料。不得使用预训练记忆、常识或经验补充外部规则、事实或法律结论。风险等级按本提示中的内部定级准则，结合已核实的合同事实和检索资料判断；该准则不是外部依据，不能单独支撑法律结论。缺少相关外部依据时，明确说明依据不足，不得自行补造。

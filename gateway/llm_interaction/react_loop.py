@@ -2,8 +2,10 @@
 
 import asyncio
 import json
+import logging
 from time import perf_counter
 from typing import Any, AsyncGenerator, Dict
+from uuid import uuid4
 
 from starlette.concurrency import iterate_in_threadpool
 
@@ -13,7 +15,11 @@ from services.report_parser import clean_report_content, parse_structured_report
 from .context_manager import ContextWindowError, ContextWindowManager
 from .contracts import ToolExecutionResult
 from .events import encode_event
-from .final_report import FinalReportValidationError, validate_final_report
+from .final_report import (
+    FinalReportValidationError,
+    recover_final_report,
+    validate_final_report,
+)
 from .guardrails import detect_contract_flags
 from .prompt_builder import PROMPT_VERSION, build_review_messages
 from .report_finalizer import ReportFinalizer
@@ -24,6 +30,29 @@ from .tool_executor import ToolExecutor
 
 
 FINAL_REPORT_RETRY_LIMIT = 2
+MODEL_STREAM_LOG_INTERVAL_SECONDS = 15
+LOGGER = logging.getLogger("uvicorn.error")
+
+
+async def _log_model_stream_progress(
+    trace_id: str,
+    turn: int,
+    request_started: float,
+    progress: Dict[str, int],
+) -> None:
+    while True:
+        await asyncio.sleep(MODEL_STREAM_LOG_INTERVAL_SECONDS)
+        LOGGER.info(
+            "react_model_stream_progress trace_id=%s turn=%d elapsed_ms=%d "
+            "chunks=%d reasoning_chars=%d content_chars=%d tool_call_deltas=%d",
+            trace_id,
+            turn,
+            int((perf_counter() - request_started) * 1000),
+            progress["chunks"],
+            progress["reasoning_chars"],
+            progress["content_chars"],
+            progress["tool_call_deltas"],
+        )
 
 
 def _max_output_tokens(max_context_tokens: int, requested_output_tokens: int) -> int:
@@ -160,6 +189,21 @@ class ReactLoop:
         recorder = ToolCallRecorder(task_label)
         recorder.start()
         turn_limit = max(max_turns, len(required_tool_names) + 1)
+        trace_id = uuid4().hex[:12]
+        stream_started = perf_counter()
+
+        LOGGER.info(
+            "react_started trace_id=%s model=%s review_side=%s turn_limit=%d "
+            "required_tools=%d max_output_tokens=%d contract_chars=%d guardrails=%d",
+            trace_id,
+            self.agent.model_name,
+            review_side,
+            turn_limit,
+            len(required_tool_names),
+            max_output_tokens,
+            len(contract_text),
+            len(guardrail_codes),
+        )
 
         yield encode_event("start", {
             "task_id": task_label,
@@ -216,6 +260,12 @@ class ReactLoop:
                     enterprise_evidence_pinned=enterprise_evidence_pinned,
                 )
             except ContextWindowError as exc:
+                LOGGER.warning(
+                    "react_context_window_error trace_id=%s turn=%d error=%s",
+                    trace_id,
+                    turn,
+                    exc,
+                )
                 yield encode_event("error", {
                     "task_id": task_label,
                     "error": str(exc),
@@ -226,12 +276,42 @@ class ReactLoop:
             response = None
             request_started = perf_counter()
             first_token_ms = None
+            progress = {
+                "chunks": 0,
+                "reasoning_chars": 0,
+                "content_chars": 0,
+                "tool_call_deltas": 0,
+            }
+            requested_tool_names = [
+                tool["function"]["name"] for tool in request_tools
+            ]
+            LOGGER.info(
+                "react_model_request_started trace_id=%s turn=%d/%d model=%s "
+                "max_tokens=%d messages=%d input_chars=%d tools=%s force_final=%s",
+                trace_id,
+                turn,
+                turn_limit,
+                self.agent.model_name,
+                max_output_tokens,
+                len(request_messages),
+                sum(len(str(message.get("content") or "")) for message in request_messages),
+                ",".join(requested_tool_names),
+                force_final_report,
+            )
             yield encode_event("model_start", {
                 "task_id": task_label,
                 "turn": turn,
                 "model": self.agent.model_name,
                 "message": "正在请求模型生成响应；若本轮调用工具，模型可能不返回自然语言文本。",
             })
+            heartbeat_task = asyncio.create_task(
+                _log_model_stream_progress(
+                    trace_id,
+                    turn,
+                    request_started,
+                    progress,
+                )
+            )
             request_options = {
                 "model": self.agent.model_name,
                 "messages": request_messages,
@@ -262,8 +342,25 @@ class ReactLoop:
                     **request_options,
                 )
                 async for chunk in iterate_in_threadpool(response):
+                    progress["chunks"] += 1
+                    choices = getattr(chunk, "choices", None) or []
+                    if choices:
+                        delta = getattr(choices[0], "delta", None)
+                        reasoning = (
+                            getattr(delta, "reasoning", None)
+                            or getattr(delta, "reasoning_content", None)
+                        ) if delta else None
+                        if reasoning:
+                            progress["reasoning_chars"] += len(reasoning)
+                        progress["tool_call_deltas"] += len(
+                            getattr(delta, "tool_calls", None) or []
+                        ) if delta else 0
                     text, report_deltas = decoder.feed(chunk)
                     if text or report_deltas:
+                        progress["content_chars"] += len(text or "")
+                        progress["content_chars"] += sum(
+                            len(item) for item in report_deltas
+                        )
                         if first_token_ms is None:
                             first_token_ms = int((perf_counter() - request_started) * 1000)
                     if text:
@@ -276,19 +373,45 @@ class ReactLoop:
                             "task_id": task_label,
                             "token": report_delta,
                         })
+            except asyncio.CancelledError:
+                LOGGER.info(
+                    "react_model_request_cancelled trace_id=%s turn=%d elapsed_ms=%d",
+                    trace_id,
+                    turn,
+                    int((perf_counter() - request_started) * 1000),
+                )
+                raise
             except Exception as exc:
+                LOGGER.exception(
+                    "react_model_request_failed trace_id=%s turn=%d elapsed_ms=%d "
+                    "error_type=%s",
+                    trace_id,
+                    turn,
+                    int((perf_counter() - request_started) * 1000),
+                    type(exc).__name__,
+                )
                 yield encode_event("error", {
                     "task_id": task_label,
                     "error": f"大模型交互失败: {exc}",
                 })
                 return
             finally:
+                heartbeat_task.cancel()
+                try:
+                    await heartbeat_task
+                except asyncio.CancelledError:
+                    pass
                 close = getattr(response, "close", None)
                 if close:
                     try:
                         await asyncio.to_thread(close)
                     except Exception:
-                        pass
+                        LOGGER.warning(
+                            "react_model_response_close_failed trace_id=%s turn=%d",
+                            trace_id,
+                            turn,
+                            exc_info=True,
+                        )
 
             elapsed_ms = int((perf_counter() - request_started) * 1000)
             completed_turns = turn
@@ -301,6 +424,25 @@ class ReactLoop:
                 "content": content,
                 "tool_calls": [call.model_dump() for call in tool_calls],
             })
+            LOGGER.info(
+                "react_model_request_completed trace_id=%s turn=%d elapsed_ms=%d "
+                "first_content_ms=%s finish_reason=%s prompt_tokens=%d "
+                "completion_tokens=%d usage_source=%s reasoning_chars=%d "
+                "content_chars=%d chunks=%d tool_calls=%d",
+                trace_id,
+                turn,
+                elapsed_ms,
+                first_token_ms,
+                decoder.finish_reason or "none",
+                prompt_tokens,
+                completion_tokens,
+                "model" if decoder.prompt_tokens is not None
+                and decoder.completion_tokens is not None else "estimated",
+                progress["reasoning_chars"],
+                progress["content_chars"],
+                progress["chunks"],
+                len(tool_calls),
+            )
             yield encode_event("model_usage", {
                 "task_id": task_label,
                 "turn": turn,
@@ -314,6 +456,15 @@ class ReactLoop:
             })
 
             for call in tool_calls:
+                LOGGER.info(
+                    "react_tool_call_received trace_id=%s turn=%d tool=%s "
+                    "call_id=%s argument_chars=%d",
+                    trace_id,
+                    turn,
+                    call.name,
+                    call.call_id,
+                    len(call.arguments),
+                )
                 recorder.record_call(
                     turn,
                     call.call_id,
@@ -380,6 +531,16 @@ class ReactLoop:
                             force_final_report = True
                             if final_report_retries < FINAL_REPORT_RETRY_LIMIT:
                                 final_report_retries += 1
+                                LOGGER.warning(
+                                    "react_empty_model_response trace_id=%s turn=%d "
+                                    "finish_reason=%s retry=%d/%d reasoning_chars=%d",
+                                    trace_id,
+                                    turn,
+                                    decoder.finish_reason or "none",
+                                    final_report_retries,
+                                    FINAL_REPORT_RETRY_LIMIT,
+                                    progress["reasoning_chars"],
+                                )
                             yield encode_event("tool_start", {
                                 "task_id": task_label,
                                 "tool": call.name,
@@ -416,45 +577,32 @@ class ReactLoop:
                                 contract_text,
                             )
                         except FinalReportValidationError as exc:
-                            force_final_report = True
-                            if final_report_retries < FINAL_REPORT_RETRY_LIMIT:
-                                final_report_retries += 1
-                            observation = json.dumps({
-                                "ok": False,
-                                "error": str(exc),
-                                "instruction": (
-                                    "只重新提交 submit_final_report。acknowledged_guardrails 只能包含本次程序规则代码，"
-                                    "不得填写工具名、证据编号或法规编号；没有程序规则代码时传空数组。"
-                                    "如果错误指出遗漏条款，必须补齐对应审查项；没有实质风险时如实说明，不得虚构风险。"
-                                ),
-                            }, ensure_ascii=False)
-                            result = ToolExecutionResult(
-                                call_id=call.call_id,
-                                tool_name=call.name,
-                                success=False,
-                                observation=observation,
-                                error=str(exc),
-                                elapsed_ms=int((perf_counter() - started) * 1000),
+                            LOGGER.warning(
+                                "react_final_report_rejected trace_id=%s turn=%d "
+                                "reason=%s issue_count=%d issue_types=%s "
+                                "finish_reason=%s retry=%d/%d rejected_arguments=%s",
+                                trace_id,
+                                turn,
+                                exc.reason_code,
+                                exc.issue_count,
+                                ",".join(exc.issue_types) or "none",
+                                decoder.finish_reason or "none",
+                                final_report_retries,
+                                FINAL_REPORT_RETRY_LIMIT,
+                                json.dumps(call.arguments, ensure_ascii=False),
                             )
-                        else:
-                            if len(tool_calls) != 1:
-                                force_final_report = True
-                                if final_report_retries < FINAL_REPORT_RETRY_LIMIT:
-                                    final_report_retries += 1
-                                observation = json.dumps({
-                                    "ok": False,
-                                    "error": "最终报告提交必须是本轮唯一工具调用。",
-                                    "instruction": "单独重新提交最终报告。",
-                                }, ensure_ascii=False)
-                                result = ToolExecutionResult(
-                                    call_id=call.call_id,
-                                    tool_name=call.name,
-                                    success=False,
-                                    observation=observation,
-                                    error="最终报告提交必须是本轮唯一工具调用。",
-                                    elapsed_ms=int((perf_counter() - started) * 1000),
+                            fallback = recover_final_report(call, guardrail_codes)
+                            if fallback is not None:
+                                submission, normalized_fields, dropped_reviews = fallback
+                                LOGGER.warning(
+                                    "react_final_report_fallback trace_id=%s turn=%d "
+                                    "reason=%s normalized_fields=%d dropped_reviews=%d",
+                                    trace_id,
+                                    turn,
+                                    exc.reason_code,
+                                    normalized_fields,
+                                    dropped_reviews,
                                 )
-                            else:
                                 recorder.record_result(
                                     call.call_id,
                                     json.dumps(
@@ -478,12 +626,133 @@ class ReactLoop:
                                 ):
                                     yield event
                                 return
+                            force_final_report = True
+                            if final_report_retries < FINAL_REPORT_RETRY_LIMIT:
+                                final_report_retries += 1
+                            LOGGER.warning(
+                                "react_final_report_fallback_unavailable "
+                                "trace_id=%s turn=%d reason=%s",
+                                trace_id,
+                                turn,
+                                exc.reason_code,
+                            )
+                            observation = json.dumps({
+                                "ok": False,
+                                "error": str(exc),
+                                "instruction": (
+                                    "只重新提交 submit_final_report。acknowledged_guardrails 只能包含本次程序规则代码，"
+                                    "不得填写工具名、证据编号或法规编号；没有程序规则代码时传空数组。"
+                                    "如果错误指出遗漏条款，必须补齐对应审查项；没有实质风险时如实说明，不得虚构风险。"
+                                ),
+                            }, ensure_ascii=False)
+                            result = ToolExecutionResult(
+                                call_id=call.call_id,
+                                tool_name=call.name,
+                                success=False,
+                                observation=observation,
+                                error=str(exc),
+                                elapsed_ms=int((perf_counter() - started) * 1000),
+                            )
+                        else:
+                            if len(tool_calls) != 1:
+                                force_final_report = True
+                                if final_report_retries < FINAL_REPORT_RETRY_LIMIT:
+                                    final_report_retries += 1
+                                LOGGER.warning(
+                                    "react_final_report_rejected trace_id=%s turn=%d "
+                                    "reason=multiple_final_report_tool_calls "
+                                    "tool_call_count=%d retry=%d/%d "
+                                    "rejected_arguments=%s",
+                                    trace_id,
+                                    turn,
+                                    len(tool_calls),
+                                    final_report_retries,
+                                    FINAL_REPORT_RETRY_LIMIT,
+                                    json.dumps(call.arguments, ensure_ascii=False),
+                                )
+                                LOGGER.warning(
+                                    "react_final_report_fallback trace_id=%s turn=%d "
+                                    "reason=multiple_final_report_tool_calls "
+                                    "normalized_fields=0 dropped_reviews=0",
+                                    trace_id,
+                                    turn,
+                                )
+                                recorder.record_result(
+                                    call.call_id,
+                                    json.dumps(
+                                        {"report": submission.report.model_dump(mode="json")},
+                                        ensure_ascii=False,
+                                    ),
+                                    True,
+                                    int((perf_counter() - started) * 1000),
+                                )
+                                finalizer = ReportFinalizer(self.agent)
+                                async for event in finalizer.finalize(
+                                    report=submission.report.model_dump_json(
+                                        ensure_ascii=False
+                                    ),
+                                    contract_text=contract_text,
+                                    task_id=task_label,
+                                    turn=turn,
+                                    acknowledged_guardrails=submission.acknowledged_guardrails,
+                                    finish_reason=decoder.finish_reason,
+                                    tool_call_records=recorder,
+                                ):
+                                    yield event
+                                return
+                            else:
+                                recorder.record_result(
+                                    call.call_id,
+                                    json.dumps(
+                                        {"report": submission.report.model_dump(mode="json")},
+                                        ensure_ascii=False,
+                                    ),
+                                    True,
+                                    int((perf_counter() - started) * 1000),
+                                )
+                                LOGGER.info(
+                                    "react_final_report_accepted trace_id=%s turn=%d "
+                                    "finish_reason=%s elapsed_ms=%d total_elapsed_ms=%d",
+                                    trace_id,
+                                    turn,
+                                    decoder.finish_reason or "none",
+                                    elapsed_ms,
+                                    int((perf_counter() - stream_started) * 1000),
+                                )
+                                finalizer = ReportFinalizer(self.agent)
+                                async for event in finalizer.finalize(
+                                    report=submission.report.model_dump_json(
+                                        ensure_ascii=False
+                                    ),
+                                    contract_text=contract_text,
+                                    task_id=task_label,
+                                    turn=turn,
+                                    acknowledged_guardrails=submission.acknowledged_guardrails,
+                                    finish_reason=decoder.finish_reason,
+                                    tool_call_records=recorder,
+                                ):
+                                    yield event
+                                return
                     else:
                         result = await asyncio.to_thread(executor.execute, call)
                         if result.duplicate:
                             duplicate_query_count += 1
                             if duplicate_query_count >= 2:
                                 force_final_report = True
+
+                    LOGGER.info(
+                        "react_tool_call_completed trace_id=%s turn=%d tool=%s "
+                        "call_id=%s success=%s duplicate=%s elapsed_ms=%d "
+                        "observation_chars=%d",
+                        trace_id,
+                        turn,
+                        call.name,
+                        call.call_id,
+                        result.success,
+                        result.duplicate,
+                        result.elapsed_ms,
+                        len(result.observation),
+                    )
 
                     query = executor.query_preview(call)
                     yield encode_event("tool_start", {
@@ -562,6 +831,14 @@ class ReactLoop:
                     f"（finish_reason={decoder.finish_reason}）"
                     if decoder.finish_reason else ""
                 )
+                LOGGER.error(
+                    "react_empty_model_response_exhausted trace_id=%s turn=%d "
+                    "finish_reason=%s total_elapsed_ms=%d",
+                    trace_id,
+                    turn,
+                    decoder.finish_reason or "none",
+                    int((perf_counter() - stream_started) * 1000),
+                )
                 yield encode_event("error", {
                     "task_id": task_label,
                     "error": f"模型未返回文本或有效工具调用{finish_reason}。",
@@ -570,6 +847,12 @@ class ReactLoop:
             final_report_text = clean_report_content(content)
             parsed_report = parse_structured_report(final_report_text)
             if parsed_report:
+                LOGGER.info(
+                    "react_text_report_accepted trace_id=%s turn=%d total_elapsed_ms=%d",
+                    trace_id,
+                    turn,
+                    int((perf_counter() - stream_started) * 1000),
+                )
                 finalizer = ReportFinalizer(self.agent)
                 async for event in finalizer.finalize(
                     report=parsed_report.model_dump_json(ensure_ascii=False),
@@ -602,6 +885,15 @@ class ReactLoop:
             "status": "incomplete",
             "acknowledged_guardrails": [],
         })
+        LOGGER.error(
+            "react_turn_limit_reached trace_id=%s completed_turns=%d turn_limit=%d "
+            "final_report_retries=%d total_elapsed_ms=%d",
+            trace_id,
+            completed_turns,
+            turn_limit,
+            final_report_retries,
+            int((perf_counter() - stream_started) * 1000),
+        )
         yield encode_event("error", {
             "task_id": task_label,
             "error": (
